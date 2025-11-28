@@ -135,7 +135,7 @@ class Investment(Base):
 # 2. 로그인 (내부용 간단 로그인)
 # =========================
 
-ADMIN_PASSWORD = "madde-admin"
+ADMIN_PASSWORD = "aodlem0627@"
 VIEWER_PASSWORD = "madde-viewer"
 
 @app.post("/login")
