@@ -13,7 +13,9 @@ import shutil, os, re
 app = FastAPI()
 
 # ✅ CORS 설정
-origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+#   - 지금은 편의를 위해 모든 origin 허용 ("*")
+#   - 보안 강화하려면 나중에 정확한 도메인만 남겨두면 됨.
+origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -79,6 +81,7 @@ class IRFile(Base):
     upload_date = Column(String)    # 업로드 일자 (YYYY-MM-DD)
     size = Column(Integer)          # 파일 크기 (byte)
 
+
 # ✅ 인건비(사람) 테이블
 class Personnel(Base):
     __tablename__ = "personnel"
@@ -115,7 +118,6 @@ class EquipmentProjectShare(Base):
     percent = Column(Float)          # 이 과제에 투입되는 % (0~100)
 
 
-
 # ✅ 투자(Investment) 테이블
 class Investment(Base):
     __tablename__ = "investments"
@@ -129,19 +131,28 @@ class Investment(Base):
     security_type = Column(String)     # 종류 (RCPS, 보통주 등)
 
 
-
 # =========================
-# 2. 로그인
+# 2. 로그인 (내부용 간단 로그인)
 # =========================
 
-USERS = {"admin": "aodlem0627@", "viewer": "0000"}
-
+ADMIN_PASSWORD = "madde-admin"
+VIEWER_PASSWORD = "madde-viewer"
 
 @app.post("/login")
 def login(username: str = Form(...), password: str = Form(...)):
-    print("DEBUG →", username, password)
-    if username in USERS and USERS[username] == password:
-        return {"message": "로그인 성공", "role": username}
+    """
+    매우 단순한 내부용 로그인:
+    - username: "admin" 또는 "viewer" (프론트에서 role로 보냄)
+    - password:
+        admin  → madde-admin
+        viewer → madde-viewer
+    """
+    if username == "admin" and password == ADMIN_PASSWORD:
+        return {"message": "로그인 성공", "role": "admin"}
+
+    if username == "viewer" and password == VIEWER_PASSWORD:
+        return {"message": "로그인 성공", "role": "viewer"}
+
     raise HTTPException(status_code=401, detail="로그인 실패")
 
 
@@ -251,10 +262,6 @@ def delete_ip(ip_id: int):
 # 5. IR/마케팅 자료 관리
 # =========================
 
-# 🔹 IR 자료 목록 조회
-#    /ir            → 전체
-#    /ir?category=IR   → IR만
-#    /ir?category=사진 → 사진만  ... 등
 @app.get("/ir")
 def get_ir(category: Optional[str] = None):
     db = SessionLocal()
@@ -264,7 +271,6 @@ def get_ir(category: Optional[str] = None):
             query = query.filter(IRFile.category == category)
         records = query.all()
 
-        # 이름순 정렬 (original_name 기준, 대소문자 무시)
         result = [
             {
                 "id": r.id,
@@ -283,19 +289,16 @@ def get_ir(category: Optional[str] = None):
         db.close()
 
 
-# 🔹 IR 자료 업로드
 @app.post("/ir")
 async def upload_ir(
     file: UploadFile = File(...),
-    category: str = Form("IR"),           # IR / 사진 / 영상 / 브로셔 / 전시회 ...
-    folder: Optional[str] = Form(None),   # 선택 폴더명 (없으면 루트)
+    category: str = Form("IR"),
+    folder: Optional[str] = Form(None),
 ):
-    # 원본 파일명 & 안전한 파일명 생성
     original_name = file.filename
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", file.filename)
     stored_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe}"
 
-    # 실제 저장 경로 (uploads/ir/[folder]/stored_name)
     base_dir = IR_UPLOAD_DIR
     if folder:
         base_dir = os.path.join(IR_UPLOAD_DIR, folder)
@@ -331,7 +334,6 @@ async def upload_ir(
         db.close()
 
 
-# 🔹 IR 자료 삭제
 @app.delete("/ir/{ir_id}")
 def delete_ir(ir_id: int):
     db = SessionLocal()
@@ -340,7 +342,6 @@ def delete_ir(ir_id: int):
         if not ir:
             raise HTTPException(status_code=404, detail="해당 IR 자료를 찾을 수 없습니다.")
 
-        # 실제 파일 삭제 시도
         base_dir = IR_UPLOAD_DIR
         if ir.folder:
             base_dir = os.path.join(IR_UPLOAD_DIR, ir.folder)
@@ -350,7 +351,6 @@ def delete_ir(ir_id: int):
             if os.path.exists(file_path):
                 os.remove(file_path)
         except Exception:
-            # 파일이 없어도 DB에서는 삭제 진행
             pass
 
         db.delete(ir)
@@ -359,11 +359,11 @@ def delete_ir(ir_id: int):
     finally:
         db.close()
 
+
 # =========================
 # 6. 인건비 / 현물 현황
 # =========================
 
-# 🔹 인건비 인력 목록
 @app.get("/personnel")
 def get_personnel():
     db = SessionLocal()
@@ -374,7 +374,6 @@ def get_personnel():
         db.close()
 
 
-# 🔹 인건비 인력 등록
 @app.post("/personnel")
 def add_personnel(
     name: str = Form(...),
@@ -392,7 +391,6 @@ def add_personnel(
         db.close()
 
 
-# 🔹 인건비 인력 삭제
 @app.delete("/personnel/{person_id}")
 def delete_personnel(person_id: int):
     db = SessionLocal()
@@ -400,7 +398,6 @@ def delete_personnel(person_id: int):
         person = db.query(Personnel).filter(Personnel.id == person_id).first()
         if not person:
             raise HTTPException(status_code=404, detail="해당 인력을 찾을 수 없습니다.")
-        # 이 사람의 배분율도 같이 삭제
         db.query(PersonnelProjectShare).filter(
             PersonnelProjectShare.personnel_id == person_id
         ).delete()
@@ -411,9 +408,8 @@ def delete_personnel(person_id: int):
         db.close()
 
 
-# 🔹 사람별 과제 배분율 업데이트 (한 사람의 모든 과제 %를 한 번에 갱신)
 class ShareUpdate(BaseModel):
-    shares: Dict[str, float]  # {"과제A": 10.0, "과제B": 35.0, ...}
+    shares: Dict[str, float]
 
 
 @app.put("/personnel/{person_id}/shares")
@@ -424,12 +420,10 @@ def update_personnel_shares(person_id: int, payload: ShareUpdate):
         if not person:
             raise HTTPException(status_code=404, detail="해당 인력을 찾을 수 없습니다.")
 
-        # 기존 배분율 삭제
         db.query(PersonnelProjectShare).filter(
             PersonnelProjectShare.personnel_id == person_id
         ).delete()
 
-        # 새 배분율 저장 (0 또는 None은 저장하지 않음)
         for title, percent in (payload.shares or {}).items():
             if percent is None:
                 continue
@@ -452,7 +446,6 @@ def update_personnel_shares(person_id: int, payload: ShareUpdate):
         db.close()
 
 
-# 🔹 장비(기계장치) 목록
 @app.get("/equipment")
 def get_equipment():
     db = SessionLocal()
@@ -463,7 +456,6 @@ def get_equipment():
         db.close()
 
 
-# 🔹 장비 등록
 @app.post("/equipment")
 def add_equipment(
     name: str = Form(...),
@@ -485,7 +477,6 @@ def add_equipment(
         db.close()
 
 
-# 🔹 장비 삭제
 @app.delete("/equipment/{equipment_id}")
 def delete_equipment(equipment_id: int):
     db = SessionLocal()
@@ -503,7 +494,6 @@ def delete_equipment(equipment_id: int):
         db.close()
 
 
-# 🔹 장비 배분율 업데이트 (한 장비의 모든 과제 %를 한 번에 갱신)
 @app.put("/equipment/{equipment_id}/shares")
 def update_equipment_shares(equipment_id: int, payload: ShareUpdate):
     db = SessionLocal()
@@ -512,12 +502,10 @@ def update_equipment_shares(equipment_id: int, payload: ShareUpdate):
         if not eq:
             raise HTTPException(status_code=404, detail="해당 장비를 찾을 수 없습니다.")
 
-        # 기존 배분율 삭제
         db.query(EquipmentProjectShare).filter(
             EquipmentProjectShare.equipment_id == equipment_id
         ).delete()
 
-        # 새 배분율 저장
         for title, percent in (payload.shares or {}).items():
             if percent is None:
                 continue
@@ -540,7 +528,6 @@ def update_equipment_shares(equipment_id: int, payload: ShareUpdate):
         db.close()
 
 
-# 🔹 내부용: '진행중' / '신청완료' 과제만 추리기
 def get_active_project_titles():
     active_status = {"진행중", "신청완료"}
     titles = [
@@ -548,25 +535,11 @@ def get_active_project_titles():
         for p in PROJECTS
         if p.get("status") in active_status
     ]
-    # 제목 중복 방지
     return list(dict.fromkeys(titles))
 
 
-# 🔹 현물 인건비 + 장비 집계 (화면용 pivot 데이터)
 @app.get("/assets")
 def get_assets():
-    """
-    프론트에서 사용할 구조:
-    {
-      "projects": [...],
-      "personnel_rows": [...],
-      "personnel_salary_total": 000,
-      "personnel_grand_total": 000,
-      "equipment_rows": [...],
-      "equipment_acquisition_total": 000,
-      "equipment_grand_total": 000
-    }
-    """
     db = SessionLocal()
     try:
         people = db.query(Personnel).all()
@@ -578,7 +551,6 @@ def get_assets():
 
     active_projects = get_active_project_titles()
 
-    # ----- 인건비 쪽 -----
     person_share_map: Dict[int, Dict[str, float]] = {}
     for s in person_shares:
         if s.project_title not in active_projects:
@@ -617,7 +589,6 @@ def get_assets():
             }
         )
 
-    # ----- 장비 쪽 -----
     equip_share_map: Dict[int, Dict[str, float]] = {}
     for s in equip_shares:
         if s.project_title not in active_projects:
@@ -671,7 +642,6 @@ def get_assets():
 # 7. 재무 / 투자 현황
 # =========================
 
-# 🔹 투자 이력 목록
 @app.get("/investments")
 def get_investments():
     db = SessionLocal()
@@ -682,7 +652,6 @@ def get_investments():
         db.close()
 
 
-# 🔹 투자 이력 등록
 @app.post("/investments")
 def add_investment(
     round: str = Form(...),
@@ -712,7 +681,6 @@ def add_investment(
         db.close()
 
 
-# 🔹 투자 이력 수정
 @app.put("/investments/{investment_id}")
 def update_investment(
     investment_id: int,
@@ -745,7 +713,6 @@ def update_investment(
         db.close()
 
 
-# 🔹 투자 이력 삭제
 @app.delete("/investments/{investment_id}")
 def delete_investment(investment_id: int):
     db = SessionLocal()
@@ -758,7 +725,6 @@ def delete_investment(investment_id: int):
         return {"message": "투자 이력 삭제 완료 ✅"}
     finally:
         db.close()
-
 
 
 # =========================
@@ -870,8 +836,6 @@ def list_project_files(project_id: int):
     if not project:
         raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
     return project["files"]
-
-
 
 
 Base.metadata.create_all(bind=engine)
