@@ -138,16 +138,17 @@ class ProcessOrder(Base):
     id = Column(Integer, primary_key=True)
     company_name = Column(String, nullable=False)          # 업체명
     quote_date = Column(String, nullable=False)            # 견적일 (YYYY-MM-DD)
-    category = Column(String, nullable=False)              # 구분 (RSiC, RBSC 등)
+    category = Column(String, nullable=False)              # 구분 (RBSC, RSiC, WAAM, 기타)
     product_name = Column(String, nullable=False)          # 품명
     quantity = Column(Integer, nullable=False)             # 수량
-    unit_manufacturing_cost = Column(Integer, nullable=False)  # 제조원가(개당)
+    unit_manufacturing_cost = Column(Integer, nullable=False)  # 전체 제조원가
     unit_quote_price = Column(Integer, nullable=False)     # 개당 견적가
     total_quote_price = Column(Integer, nullable=False)    # 총 견적가
-    status = Column(String, nullable=False)                # 상태 (견적중/발주/완료 등)
+    status = Column(String, nullable=False)                # 견적중 / 제작중 / 납품완료 / 미진행
     actual_order_amount = Column(Integer)                  # 실제 발주금액
     margin_rate = Column(Float)                            # 마진율(%)
     related_file = Column(String)                          # 관련 파일명/경로
+    delivered_at = Column(String)                          # 납품완료일 (YYYY-MM-DD, 매출 인식 기준)
 
 
 # ✅ 공정 데이터 - 주문별 공정 상태
@@ -688,7 +689,6 @@ def get_assets():
         "equipment_grand_total": int(equipment_grand_total),
     }
 
-
 # =========================
 # 7. 공정 데이터 API
 # =========================
@@ -697,16 +697,20 @@ class ProcessOrderSchema(BaseModel):
     id: Optional[int] = None
     company_name: str
     quote_date: str
-    category: str
+    category: str                # RBSC / RSiC / WAAM / 기타
     product_name: str
     quantity: int
-    unit_manufacturing_cost: int
+    unit_manufacturing_cost: int # 전체 제조원가로 사용
     unit_quote_price: int
     total_quote_price: int
-    status: str
+    status: str                  # 견적중 / 제작중 / 납품완료 / 미진행
     actual_order_amount: Optional[int] = None
     margin_rate: Optional[float] = None
     related_file: Optional[str] = None
+    delivered_at: Optional[str] = None  # 납품완료일 (납품완료 상태 시 입력)
+
+    class Config:
+        orm_mode = True
 
 
 class ProcessOrderStatusSchema(BaseModel):
@@ -718,6 +722,9 @@ class ProcessOrderStatusSchema(BaseModel):
     current_detail: Optional[str] = None
     priority: Optional[str] = None
 
+    class Config:
+        orm_mode = True
+
 
 class UnitCostSchema(BaseModel):
     id: str
@@ -726,6 +733,9 @@ class UnitCostSchema(BaseModel):
     unit_price: float
     unit: str
     note: Optional[str] = None
+
+    class Config:
+        orm_mode = True
 
 
 class ProcessTrackingSchema(BaseModel):
@@ -736,20 +746,29 @@ class ProcessTrackingSchema(BaseModel):
     bed_density: Optional[float] = None
     note: Optional[str] = None
 
+    class Config:
+        orm_mode = True
 
-# ---- 견적/발주 현황 ----
+
+# ---- 견적/발주(=제작 및 매출 현황) 목록 ----
 @app.get("/process/orders", response_model=List[ProcessOrderSchema])
 def get_process_orders():
+    """
+    제작 및 매출 현황 테이블용 전체 리스트
+    """
     db = SessionLocal()
     try:
-        rows = db.query(ProcessOrder).order_by(
-            ProcessOrder.quote_date.desc(), ProcessOrder.id.desc()
-        ).all()
+        rows = (
+            db.query(ProcessOrder)
+            .order_by(ProcessOrder.quote_date.desc(), ProcessOrder.id.desc())
+            .all()
+        )
         return rows
     finally:
         db.close()
 
 
+# ---- 견적/발주(=제작 및 매출 현황) 생성 ----
 @app.post("/process/orders", response_model=ProcessOrderSchema)
 async def create_process_order(
     company_name: str = Form(...),
@@ -759,7 +778,7 @@ async def create_process_order(
     quantity: int = Form(...),
     manufacturing_cost: int = Form(...),   # ✅ 전체 제조원가
     total_quote_price: int = Form(...),    # ✅ 전체 견적가
-    status: str = Form(...),               # 견적중 / 진행중 / 발주완료 / 미진행
+    status: str = Form(...),               # 견적중 / 제작중 / 납품완료 / 미진행
     actual_order_amount: Optional[int] = Form(None),
     file: Optional[UploadFile] = File(None),  # CAD 등 파일
 ):
@@ -786,24 +805,104 @@ async def create_process_order(
                 * 100.0
             )
 
+        delivered_at = None
+        if status == "납품완료":
+            delivered_at = datetime.now().strftime("%Y-%m-%d")
+
         obj = ProcessOrder(
             company_name=company_name,
             quote_date=quote_date,
             category=category,
             product_name=product_name,
             quantity=quantity,
-            # DB 컬럼 이름은 그대로 쓰되, 의미는 "전체 제조원가"로 사용
+            # 이 컬럼은 "전체 제조원가" 의미로 사용
             unit_manufacturing_cost=manufacturing_cost,
-            # DB에 개당 견적가 저장
             unit_quote_price=unit_quote_price,
-            # DB에 전체 견적가 저장
             total_quote_price=total_quote_price,
             status=status,
             actual_order_amount=actual_order_amount,
             margin_rate=margin_rate,
-            related_file=stored_name,  # 업로드된 파일명
+            related_file=stored_name,
+            delivered_at=delivered_at,
         )
         db.add(obj)
+        db.commit()
+        db.refresh(obj)
+
+        # 🔹 상태가 '제작중'으로 생성된 경우 → 공정 데이터용 기본 row 생성
+        if status == "제작중":
+            tracking = ProcessTracking(order_id=obj.id)
+            db.add(tracking)
+            db.commit()
+
+        return obj
+    finally:
+        db.close()
+
+
+# ---- 견적/발주(=제작 및 매출 현황) 수정 ----
+@app.put("/process/orders/{order_id}", response_model=ProcessOrderSchema)
+async def update_process_order(order_id: int, payload: ProcessOrderSchema):
+    """
+    제작 및 매출 현황에서 행 수정할 때 사용하는 API
+    - status가 '제작중'으로 바뀌면 공정 데이터(Tracking) 자동 생성
+    - status가 '납품완료'로 바뀌면 delivered_at 찍어서 매출 인식
+    """
+    db = SessionLocal()
+    try:
+        obj: ProcessOrder = (
+            db.query(ProcessOrder).filter(ProcessOrder.id == order_id).first()
+        )
+        if not obj:
+            raise HTTPException(status_code=404, detail="해당 주문을 찾을 수 없습니다.")
+
+        old_status = obj.status
+
+        # 기본 정보 업데이트
+        obj.company_name = payload.company_name
+        obj.quote_date = payload.quote_date
+        obj.category = payload.category
+        obj.product_name = payload.product_name
+        obj.quantity = payload.quantity
+        obj.status = payload.status
+        obj.actual_order_amount = payload.actual_order_amount
+        obj.related_file = payload.related_file
+
+        # 제조원가/견적가/마진율 업데이트
+        obj.unit_manufacturing_cost = payload.unit_manufacturing_cost
+        obj.total_quote_price = payload.total_quote_price
+        # 개당 견적가 재계산
+        if obj.quantity and obj.total_quote_price:
+            obj.unit_quote_price = int(obj.total_quote_price / obj.quantity)
+        else:
+            obj.unit_quote_price = 0
+
+        # 마진율 재계산
+        if obj.total_quote_price:
+            obj.margin_rate = (
+                (obj.total_quote_price - (obj.unit_manufacturing_cost or 0))
+                / obj.total_quote_price
+                * 100.0
+            )
+        else:
+            obj.margin_rate = None
+
+        # 🔹 status 변화에 따른 처리
+        # 1) 제작중으로 변경된 경우 → 공정 Tracking 자동 생성
+        if old_status != "제작중" and obj.status == "제작중":
+            existing = (
+                db.query(ProcessTracking)
+                .filter(ProcessTracking.order_id == obj.id)
+                .first()
+            )
+            if not existing:
+                tracking = ProcessTracking(order_id=obj.id)
+                db.add(tracking)
+
+        # 2) 납품완료로 변경된 경우 → delivered_at 기록
+        if old_status != "납품완료" and obj.status == "납품완료":
+            obj.delivered_at = datetime.now().strftime("%Y-%m-%d")
+
         db.commit()
         db.refresh(obj)
         return obj
@@ -812,7 +911,10 @@ async def create_process_order(
 
 
 # ---- 공정 상태 ----
-@app.get("/process/orders/{order_id}/status", response_model=List[ProcessOrderStatusSchema])
+@app.get(
+    "/process/orders/{order_id}/status",
+    response_model=List[ProcessOrderStatusSchema],
+)
 def get_order_status(order_id: int):
     db = SessionLocal()
     try:
@@ -824,11 +926,13 @@ def get_order_status(order_id: int):
         db.close()
 
 
-@app.post("/process/orders/{order_id}/status", response_model=ProcessOrderStatusSchema)
+@app.post(
+    "/process/orders/{order_id}/status",
+    response_model=ProcessOrderStatusSchema,
+)
 def create_or_update_order_status(order_id: int, payload: ProcessOrderStatusSchema):
     db = SessionLocal()
     try:
-        # 단일 레코드만 관리한다고 가정하고, 있으면 업데이트 / 없으면 생성
         existing = (
             db.query(ProcessOrderStatus)
             .filter(ProcessOrderStatus.order_id == order_id)
@@ -932,6 +1036,10 @@ def delete_unit_cost(unit_id: str):
 # ---- 공정 Raw Tracking ----
 @app.get("/process/trackings", response_model=List[ProcessTrackingSchema])
 def get_trackings():
+    """
+    공정 데이터 탭에서 사용할 Raw Tracking 리스트
+    - 보통 status = 제작중 인 주문들이 대상이 될 것
+    """
     db = SessionLocal()
     try:
         rows = db.query(ProcessTracking).all()
@@ -992,6 +1100,71 @@ def delete_tracking(tracking_id: int):
         return {"message": "추적 데이터 삭제 완료 ✅"}
     finally:
         db.close()
+
+# ---- 제작 및 매출 현황 상단 KPI용 요약 API ----
+@app.get("/sales/summary")
+def get_sales_summary():
+    """
+    제작 및 매출 현황 상단 카드용:
+    - total_sales_all      : 전체 매출 (납품완료 기준, 총 견적가 합)
+    - total_sales_year     : 올해 매출
+    - total_sales_quarter  : 이번 분기 매출
+    - total_sales_month    : 이번 달 매출
+    """
+    db = SessionLocal()
+    try:
+        now = datetime.now()
+        this_year = now.year
+        this_month = now.month
+        this_quarter = (this_month - 1) // 3 + 1
+
+        def parse_date(s: Optional[str]):
+            if not s:
+                return None
+            try:
+                return datetime.strptime(s, "%Y-%m-%d")
+            except Exception:
+                return None
+
+        # 납품완료된 주문만 매출로 인식
+        delivered_orders = db.query(ProcessOrder).filter(
+            ProcessOrder.status == "납품완료"
+        ).all()
+
+        total_all = 0
+        total_year = 0
+        total_quarter = 0
+        total_month = 0
+
+        for o in delivered_orders:
+            amount = int(o.total_quote_price or 0)
+            total_all += amount
+            d = parse_date(o.delivered_at)
+            if not d:
+                continue
+
+            if d.year == this_year:
+                total_year += amount
+
+                q = (d.month - 1) // 3 + 1
+                if q == this_quarter:
+                    total_quarter += amount
+
+                if d.month == this_month:
+                    total_month += amount
+
+        return {
+            "year": this_year,
+            "quarter": this_quarter,
+            "month": this_month,
+            "total_sales_all": total_all,
+            "total_sales_year": total_year,
+            "total_sales_quarter": total_quarter,
+            "total_sales_month": total_month,
+        }
+    finally:
+        db.close()
+
 
 
 # =========================
