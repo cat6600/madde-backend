@@ -486,48 +486,56 @@ def get_ir(category: Optional[str] = None):
 
 @app.post("/ir")
 async def upload_ir(
-    file: UploadFile = File(...),
+    file: List[UploadFile] = File(...),   # ✅ 여러 파일
     category: str = Form("IR"),
     folder: Optional[str] = Form(None),
 ):
-    original_name = file.filename
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", file.filename)
-    stored_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe}"
+    """
+    IR/마케팅 자료 다중 파일 업로드
+    - file: 같은 category/folder로 업로드할 여러 파일들
+    """
+    saved_ids = []
 
+    # 폴더 경로 결정
     base_dir = IR_UPLOAD_DIR
     if folder:
         base_dir = os.path.join(IR_UPLOAD_DIR, folder)
     os.makedirs(base_dir, exist_ok=True)
 
-    file_path = os.path.join(base_dir, stored_name)
-    with open(file_path, "wb") as b:
-        shutil.copyfileobj(file.file, b)
-
-    file_size = os.path.getsize(file_path)
-    upload_date = datetime.now().strftime("%Y-%m-%d")
-
     db = SessionLocal()
     try:
-        ir = IRFile(
-            original_name=original_name,
-            stored_name=stored_name,
-            category=category,
-            folder=folder,
-            upload_date=upload_date,
-            size=file_size,
-        )
-        db.add(ir)
-        db.commit()
-        db.refresh(ir)
+        for f in file:
+            original_name = f.filename
+            safe = re.sub(r"[^A-Za-z0-9_.-]", "_", original_name)
+            stored_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe}"
+
+            file_path = os.path.join(base_dir, stored_name)
+            with open(file_path, "wb") as b:
+                shutil.copyfileobj(f.file, b)
+
+            file_size = os.path.getsize(file_path)
+            upload_date = datetime.now().strftime("%Y-%m-%d")
+
+            ir = IRFile(
+                original_name=original_name,
+                stored_name=stored_name,
+                category=category,
+                folder=folder,
+                upload_date=upload_date,
+                size=file_size,
+            )
+            db.add(ir)
+            db.commit()
+            db.refresh(ir)
+            saved_ids.append(ir.id)
+
         return {
             "message": "IR 자료 업로드 완료 ✅",
-            "id": ir.id,
-            "original_name": ir.original_name,
-            "stored_name": ir.stored_name,
+            "count": len(saved_ids),
+            "ids": saved_ids,
         }
     finally:
         db.close()
-
 
 @app.delete("/ir/{ir_id}")
 def delete_ir(ir_id: int):
@@ -1551,35 +1559,7 @@ class ProjectBase(BaseModel):
     participants: Optional[str] = None
 
 
-# 간단한 데모/임시 용도. 서버 재시작 시 초기화됨.
-PROJECTS: list[dict] = [
-    {
-        "id": 1,
-        "title": "고성능 세라믹 소재 개발",
-        "organization": "산업통상자원부",
-        "type": "R&D",
-        "period": "2024-01-01 ~ 2026-12-31",
-        "budget": 15.0,
-        "status": "진행중",
-        "due_date": "2024-01-10",
-        "participants": "김철수, 박민수, 이영희",
-        "files": ["세라믹_계획서.pdf"],
-        "last_updated": "2025-11-27",
-    },
-    {
-        "id": 2,
-        "title": "신제품 사업화 지원",
-        "organization": "중소벤처기업부",
-        "type": "사업화",
-        "period": "2024-07-01 ~ 2025-06-30",
-        "budget": 5.0,
-        "status": "신청예정",
-        "due_date": "2024-06-01",
-        "participants": "이영희, 정다운",
-        "files": [],
-        "last_updated": "2025-11-20",
-    },
-]
+PROJECTS: list[dict] = []
 
 
 @app.get("/projects")
