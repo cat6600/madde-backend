@@ -29,6 +29,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 IR_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "ir")
 os.makedirs(IR_UPLOAD_DIR, exist_ok=True)
 
+# IP 전용 폴더 (uploads/ip)
+IP_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "ip")
+os.makedirs(IP_UPLOAD_DIR, exist_ok=True)
+
 # ✅ 공정 데이터(CAD 등) 전용 폴더
 PROCESS_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "process")
 os.makedirs(PROCESS_UPLOAD_DIR, exist_ok=True)
@@ -69,6 +73,17 @@ class IP(Base):
     reg_date = Column(String)
     inventors = Column(String)
     status = Column(String)
+
+
+# ✅ IP 파일 테이블 (특허/디자인 등 첨부파일 여러 개)
+class IPFile(Base):
+    __tablename__ = "ip_files"
+    id = Column(Integer, primary_key=True)
+    ip_id = Column(Integer, ForeignKey("ip.id"), nullable=False)
+    original_name = Column(String)  # 업로드 당시 파일 이름
+    stored_name = Column(String)    # 서버에 저장된 실제 파일 이름
+    upload_date = Column(String)    # YYYY-MM-DD
+    size = Column(Integer)          # byte 단위 크기
 
 
 # ✅ IR/마케팅 자료 테이블
@@ -149,6 +164,7 @@ class ProcessOrder(Base):
     margin_rate = Column(Float)                            # 마진율(%)
     related_file = Column(String)                          # 관련 파일명/경로
     delivered_at = Column(String)                          # 납품완료일 (YYYY-MM-DD, 매출 인식 기준)
+    due_date = Column(String)                              # 납기일 (YYYY-MM-DD)
 
 
 # ✅ 공정 데이터 - 주문별 공정 상태
@@ -156,22 +172,22 @@ class ProcessOrderStatus(Base):
     __tablename__ = "process_order_status"
     id = Column(Integer, primary_key=True)
     order_id = Column(Integer, ForeignKey("process_orders.id"), nullable=False)
-    total_process_time_hours = Column(Float)   # 총 공정시간(hr)
+    total_process_time_hours = Column(Float)   # 총 공정시간(hr) = 실제 리드타임
     current_stage = Column(String)            # 현 공정 단계
     progress_percent = Column(Float)          # 진행율(%)
     current_detail = Column(String)           # 현 상황(상세)
-    priority = Column(String)                 # 우선순위 (매우시급/시급/보통/양호/여유)
+    priority = Column(String)                 # 이슈/우선순위
 
 
 # ✅ 공정 데이터 - 단가 테이블
 class UnitCost(Base):
     __tablename__ = "unit_costs"
-    id = Column(String, primary_key=True)     # M01, G01 등
-    category = Column(String, nullable=False) # 재료비/장비비/인건비 등
-    item_name = Column(String, nullable=False)
-    unit_price = Column(Float, nullable=False)
-    unit = Column(String, nullable=False)     # KRW/g, KRW/hr ...
-    note = Column(String)                     # 비고
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)  # 자동 넘버링
+    category = Column(String, nullable=False)  # "재료비" / "소모품비"
+    item_name = Column(String, nullable=False)  # 품명
+    unit_price = Column(Float, nullable=False)  # 단가
+    unit = Column(String, nullable=False)       # KRW/kg, KRW/hr ...
+    note = Column(String)                       # 비고
 
 
 # ✅ 공정 데이터 - 제품별 Raw Tracking 테이블
@@ -181,8 +197,33 @@ class ProcessTracking(Base):
     order_id = Column(Integer, ForeignKey("process_orders.id"), nullable=False)
     product_volume_cm3 = Column(Float)   # 제품 부피
     printing_time_hr = Column(Float)     # 프린팅 시간
-    bed_density = Column(Float)         # 베드 밀도
+    bed_density = Column(Float)          # 베드 밀도
     note = Column(String)
+
+
+# ✅ 공정 데이터 - RBSC / RSiC 공정 단계별 시간 & 원가 테이블
+class ProcessTime(Base):
+    __tablename__ = "process_times"
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("process_orders.id"), nullable=False)
+    process_type = Column(String, nullable=False)  # "RBSC" / "RSiC"
+
+    # 단계별 소요 시간(hr)
+    design_hr = Column(Float, default=0)
+    printing_hr = Column(Float, default=0)
+    infiltration_hr = Column(Float, default=0)
+    bonding_hr = Column(Float, default=0)
+    lsi_hr = Column(Float, default=0)
+    machining_hr = Column(Float, default=0)
+    coating_hr = Column(Float, default=0)
+
+    # 제조원가 세부 항목 (추후 계산 로직에서 업데이트 예정)
+    material_cost = Column(Float, default=0)    # 재료비
+    consumable_cost = Column(Float, default=0)  # 소모품비
+    labor_cost = Column(Float, default=0)       # 인건비
+    equipment_cost = Column(Float, default=0)   # 장비비
+    overhead_cost = Column(Float, default=0)    # 간접비
+    total_cost = Column(Float, default=0)       # 총 제조원가
 
 
 # =========================
@@ -258,25 +299,27 @@ async def upload_research(
 
 
 # =========================
-# 4. IP 데이터 관리
+# 4. IP 데이터 관리 + 파일 관리
 # =========================
 
 @app.get("/ip")
 def get_ip():
     db = SessionLocal()
-    data = db.query(IP).all()
-    db.close()
-    return data
+    try:
+        data = db.query(IP).all()
+        return data
+    finally:
+        db.close()
 
 
 @app.post("/ip")
 def add_ip(
     title: str = Form(...),
     number: str = Form(...),
-    apply_date: str = Form(...),
-    reg_date: str = Form(...),
-    inventors: str = Form(...),
-    status: str = Form(...),
+    apply_date: str = Form(""),
+    reg_date: str = Form(""),
+    inventors: str = Form(""),
+    status: str = Form(""),
 ):
     db = SessionLocal()
     try:
@@ -303,11 +346,111 @@ def delete_ip(ip_id: int):
         ip = db.query(IP).filter(IP.id == ip_id).first()
         if not ip:
             raise HTTPException(status_code=404, detail="해당 IP를 찾을 수 없습니다.")
+
+        # ✅ 해당 IP와 연결된 파일들도 같이 삭제
+        files = db.query(IPFile).filter(IPFile.ip_id == ip_id).all()
+        for f in files:
+            file_path = os.path.join(IP_UPLOAD_DIR, f.stored_name)
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
+            db.delete(f)
+
         db.delete(ip)
         db.commit()
         return {"message": "IP 삭제 완료 ✅"}
     finally:
         db.close()
+
+
+# ---- IP 파일 목록 조회 ----
+@app.get("/ip/{ip_id}/files")
+def get_ip_files(ip_id: int):
+    db = SessionLocal()
+    try:
+        rows = db.query(IPFile).filter(IPFile.ip_id == ip_id).all()
+        return [
+            {
+                "id": r.id,
+                "ip_id": r.ip_id,
+                "original_name": r.original_name,
+                "stored_name": r.stored_name,
+                "upload_date": r.upload_date,
+                "size": r.size,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+
+# ---- IP 파일 업로드 (여러 개) ----
+@app.post("/ip/{ip_id}/files")
+async def upload_ip_files(
+    ip_id: int,
+    files: List[UploadFile] = File(...),   # ✅ 이름: files, 타입: List[UploadFile]
+):
+    db = SessionLocal()
+    try:
+        ip_obj = db.query(IP).filter(IP.id == ip_id).first()
+        if not ip_obj:
+            raise HTTPException(status_code=404, detail="해당 IP 항목이 없습니다.")
+
+        uploaded_ids = []
+
+        for file in files:
+            original_name = file.filename
+            safe = re.sub(r"[^A-Za-z0-9_.-]", "_", original_name)
+            stored_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe}"
+            file_path = os.path.join(IP_UPLOAD_DIR, stored_name)
+
+            with open(file_path, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+
+            size = os.path.getsize(file_path)
+            upload_date = datetime.now().strftime("%Y-%m-%d")
+
+            rec = IPFile(
+                ip_id=ip_id,
+                original_name=original_name,
+                stored_name=stored_name,
+                upload_date=upload_date,
+                size=size,
+            )
+            db.add(rec)
+            db.commit()
+            db.refresh(rec)
+            uploaded_ids.append(rec.id)
+
+        return {"message": "IP 파일 업로드 완료 ✅", "ids": uploaded_ids}
+    finally:
+        db.close()
+
+
+# ---- IP 파일 삭제 ----
+@app.delete("/ip/files/{file_id}")
+def delete_ip_file(file_id: int):
+    db = SessionLocal()
+    try:
+        rec = db.query(IPFile).filter(IPFile.id == file_id).first()
+        if not rec:
+            raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+        file_path = os.path.join(IP_UPLOAD_DIR, rec.stored_name)
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
+
+        db.delete(rec)
+        db.commit()
+        return {"message": "IP 파일 삭제 완료 ✅"}
+    finally:
+        db.close()
+
 
 
 # =========================
@@ -581,6 +724,11 @@ def update_equipment_shares(equipment_id: int, payload: ShareUpdate):
 
 
 def get_active_project_titles():
+    """
+    현재 메모리 기반 PROJECTS 리스트에서
+    status가 진행중/신청완료인 과제 제목만 가져옴.
+    (향후 DB 기반으로 이관 예정)
+    """
     active_status = {"진행중", "신청완료"}
     titles = [
         p["title"]
@@ -689,6 +837,7 @@ def get_assets():
         "equipment_grand_total": int(equipment_grand_total),
     }
 
+
 # =========================
 # 7. 공정 데이터 API
 # =========================
@@ -708,6 +857,7 @@ class ProcessOrderSchema(BaseModel):
     margin_rate: Optional[float] = None
     related_file: Optional[str] = None
     delivered_at: Optional[str] = None  # 납품완료일 (납품완료 상태 시 입력)
+    due_date: Optional[str] = None
 
     class Config:
         orm_mode = True
@@ -726,13 +876,20 @@ class ProcessOrderStatusSchema(BaseModel):
         orm_mode = True
 
 
-class UnitCostSchema(BaseModel):
-    id: str
+class UnitCostBase(BaseModel):
     category: str
     item_name: str
     unit_price: float
     unit: str
     note: Optional[str] = None
+
+
+class UnitCostCreate(UnitCostBase):
+    pass
+
+
+class UnitCostRead(UnitCostBase):
+    id: int
 
     class Config:
         orm_mode = True
@@ -745,6 +902,37 @@ class ProcessTrackingSchema(BaseModel):
     printing_time_hr: Optional[float] = None
     bed_density: Optional[float] = None
     note: Optional[str] = None
+
+    class Config:
+        orm_mode = True
+
+
+# ✅ RBSC / RSiC 공정 단계별 시간 & 원가 스키마
+class ProcessTimeBase(BaseModel):
+    order_id: int
+    process_type: str  # "RBSC" or "RSiC"
+
+    design_hr: float = 0
+    printing_hr: float = 0
+    infiltration_hr: float = 0
+    bonding_hr: float = 0
+    lsi_hr: float = 0
+    machining_hr: float = 0
+    coating_hr: float = 0
+
+
+class ProcessTimeCreate(ProcessTimeBase):
+    pass
+
+
+class ProcessTimeRead(ProcessTimeBase):
+    id: int
+    material_cost: float
+    consumable_cost: float
+    labor_cost: float
+    equipment_cost: float
+    overhead_cost: float
+    total_cost: float
 
     class Config:
         orm_mode = True
@@ -779,6 +967,7 @@ async def create_process_order(
     manufacturing_cost: int = Form(...),   # ✅ 전체 제조원가
     total_quote_price: int = Form(...),    # ✅ 전체 견적가
     status: str = Form(...),               # 견적중 / 제작중 / 납품완료 / 미진행
+    due_date: str = Form(...),
     actual_order_amount: Optional[int] = Form(None),
     file: Optional[UploadFile] = File(None),  # CAD 등 파일
 ):
@@ -824,6 +1013,7 @@ async def create_process_order(
             margin_rate=margin_rate,
             related_file=stored_name,
             delivered_at=delivered_at,
+            due_date=due_date,
         )
         db.add(obj)
         db.commit()
@@ -843,11 +1033,6 @@ async def create_process_order(
 # ---- 견적/발주(=제작 및 매출 현황) 수정 ----
 @app.put("/process/orders/{order_id}", response_model=ProcessOrderSchema)
 async def update_process_order(order_id: int, payload: ProcessOrderSchema):
-    """
-    제작 및 매출 현황에서 행 수정할 때 사용하는 API
-    - status가 '제작중'으로 바뀌면 공정 데이터(Tracking) 자동 생성
-    - status가 '납품완료'로 바뀌면 delivered_at 찍어서 매출 인식
-    """
     db = SessionLocal()
     try:
         obj: ProcessOrder = (
@@ -858,7 +1043,9 @@ async def update_process_order(order_id: int, payload: ProcessOrderSchema):
 
         old_status = obj.status
 
-        # 기본 정보 업데이트
+        # -----------------------------
+        # 기본 필드 업데이트
+        # -----------------------------
         obj.company_name = payload.company_name
         obj.quote_date = payload.quote_date
         obj.category = payload.category
@@ -868,16 +1055,22 @@ async def update_process_order(order_id: int, payload: ProcessOrderSchema):
         obj.actual_order_amount = payload.actual_order_amount
         obj.related_file = payload.related_file
 
-        # 제조원가/견적가/마진율 업데이트
+        # -----------------------------
+        # due_date 업데이트
+        # -----------------------------
+        obj.due_date = payload.due_date
+
+        # -----------------------------
+        # 제조원가/견적가/마진율 계산
+        # -----------------------------
         obj.unit_manufacturing_cost = payload.unit_manufacturing_cost
         obj.total_quote_price = payload.total_quote_price
-        # 개당 견적가 재계산
+
         if obj.quantity and obj.total_quote_price:
             obj.unit_quote_price = int(obj.total_quote_price / obj.quantity)
         else:
             obj.unit_quote_price = 0
 
-        # 마진율 재계산
         if obj.total_quote_price:
             obj.margin_rate = (
                 (obj.total_quote_price - (obj.unit_manufacturing_cost or 0))
@@ -887,8 +1080,9 @@ async def update_process_order(order_id: int, payload: ProcessOrderSchema):
         else:
             obj.margin_rate = None
 
-        # 🔹 status 변화에 따른 처리
-        # 1) 제작중으로 변경된 경우 → 공정 Tracking 자동 생성
+        # -----------------------------
+        # status 변화 로직 처리
+        # -----------------------------
         if old_status != "제작중" and obj.status == "제작중":
             existing = (
                 db.query(ProcessTracking)
@@ -899,13 +1093,13 @@ async def update_process_order(order_id: int, payload: ProcessOrderSchema):
                 tracking = ProcessTracking(order_id=obj.id)
                 db.add(tracking)
 
-        # 2) 납품완료로 변경된 경우 → delivered_at 기록
         if old_status != "납품완료" and obj.status == "납품완료":
             obj.delivered_at = datetime.now().strftime("%Y-%m-%d")
 
         db.commit()
         db.refresh(obj)
         return obj
+
     finally:
         db.close()
 
@@ -966,7 +1160,7 @@ def create_or_update_order_status(order_id: int, payload: ProcessOrderStatusSche
 
 
 # ---- 단가 테이블 ----
-@app.get("/process/unit-costs", response_model=List[UnitCostSchema])
+@app.get("/process/unit-costs", response_model=List[UnitCostRead])
 def get_unit_costs():
     db = SessionLocal()
     try:
@@ -976,14 +1170,14 @@ def get_unit_costs():
         db.close()
 
 
-@app.post("/process/unit-costs", response_model=UnitCostSchema)
-def create_unit_cost(cost: UnitCostSchema):
+@app.post("/process/unit-costs", response_model=UnitCostRead)
+def create_unit_cost(cost: UnitCostCreate):
+    """
+    ID는 자동 증가. 프론트에서는 category, item_name, unit, unit_price, note만 보냄.
+    """
     db = SessionLocal()
     try:
-        if db.query(UnitCost).filter(UnitCost.id == cost.id).first():
-            raise HTTPException(status_code=400, detail="이미 존재하는 ID입니다.")
         obj = UnitCost(
-            id=cost.id,
             category=cost.category,
             item_name=cost.item_name,
             unit_price=cost.unit_price,
@@ -998,8 +1192,8 @@ def create_unit_cost(cost: UnitCostSchema):
         db.close()
 
 
-@app.put("/process/unit-costs/{unit_id}", response_model=UnitCostSchema)
-def update_unit_cost(unit_id: str, cost: UnitCostSchema):
+@app.put("/process/unit-costs/{unit_id}", response_model=UnitCostRead)
+def update_unit_cost(unit_id: int, cost: UnitCostCreate):
     db = SessionLocal()
     try:
         obj = db.query(UnitCost).filter(UnitCost.id == unit_id).first()
@@ -1020,7 +1214,7 @@ def update_unit_cost(unit_id: str, cost: UnitCostSchema):
 
 
 @app.delete("/process/unit-costs/{unit_id}")
-def delete_unit_cost(unit_id: str):
+def delete_unit_cost(unit_id: int):
     db = SessionLocal()
     try:
         obj = db.query(UnitCost).filter(UnitCost.id == unit_id).first()
@@ -1038,7 +1232,6 @@ def delete_unit_cost(unit_id: str):
 def get_trackings():
     """
     공정 데이터 탭에서 사용할 Raw Tracking 리스트
-    - 보통 status = 제작중 인 주문들이 대상이 될 것
     """
     db = SessionLocal()
     try:
@@ -1100,6 +1293,54 @@ def delete_tracking(tracking_id: int):
         return {"message": "추적 데이터 삭제 완료 ✅"}
     finally:
         db.close()
+
+
+# ---- RBSC / RSiC 공정 단계별 시간 ----
+@app.post("/process/times", response_model=ProcessTimeRead)
+def upsert_process_time(data: ProcessTimeCreate):
+    """
+    RBSC / RSiC 공정 단계별 시간 입력용 API
+    - order_id + process_type 기준 upsert
+    """
+    db = SessionLocal()
+    try:
+        existing = (
+            db.query(ProcessTime)
+            .filter(
+                ProcessTime.order_id == data.order_id,
+                ProcessTime.process_type == data.process_type,
+            )
+            .first()
+        )
+
+        if existing:
+            for field, value in data.dict().items():
+                setattr(existing, field, value)
+            db.commit()
+            db.refresh(existing)
+            return existing
+
+        obj = ProcessTime(**data.dict())
+        db.add(obj)
+        db.commit()
+        db.refresh(obj)
+        return obj
+    finally:
+        db.close()
+
+
+@app.get("/process/times/{order_id}", response_model=List[ProcessTimeRead])
+def get_process_times(order_id: int):
+    """
+    특정 주문(order_id)에 대한 RBSC/RSiC 공정 시간 조회
+    """
+    db = SessionLocal()
+    try:
+        rows = db.query(ProcessTime).filter(ProcessTime.order_id == order_id).all()
+        return rows
+    finally:
+        db.close()
+
 
 # ---- 제작 및 매출 현황 상단 KPI용 요약 API ----
 @app.get("/sales/summary")
@@ -1164,7 +1405,6 @@ def get_sales_summary():
         }
     finally:
         db.close()
-
 
 
 # =========================
@@ -1257,114 +1497,90 @@ def delete_investment(investment_id: int):
 
 
 # =========================
-# 9. 과제 데이터 (임시, 메모리 기반)
+# 9. 과제 데이터 (임시, 메모리 기반) – TODO: 향후 DB 테이블로 이관
 # =========================
 
 class ProjectBase(BaseModel):
-    title: str
-    organization: Optional[str] = None
-    type: Optional[str] = None
-    period: Optional[str] = None
-    budget: Optional[float] = 0.0
-    status: Optional[str] = None
-    due_date: Optional[str] = None
-    participants: Optional[str] = None
+  title: str
+  organization: Optional[str] = None
+  type: Optional[str] = None
+  period: Optional[str] = None
+  budget: Optional[float] = 0.0
+  status: Optional[str] = None
+  due_date: Optional[str] = None
+  participants: Optional[str] = None
 
 
-PROJECTS = [
-    {
-        "id": 1,
-        "title": "고성능 세라믹 소재 개발",
-        "organization": "산업통상자원부",
-        "type": "R&D",
-        "period": "2024-01-01 ~ 2026-12-31",
-        "budget": 15.0,
-        "status": "진행중",
-        "due_date": "2024-01-10",
-        "participants": "김철수, 박민수, 이영희",
-        "files": ["세라믹_계획서.pdf"],
-        "last_updated": "2025-11-27",
-    },
-    {
-        "id": 2,
-        "title": "신제품 사업화 지원",
-        "organization": "중소벤처기업부",
-        "type": "사업화",
-        "period": "2024-07-01 ~ 2025-06-30",
-        "budget": 5.0,
-        "status": "신청예정",
-        "due_date": "2024-06-01",
-        "participants": "이영희, 정다운",
-        "files": [],
-        "last_updated": "2025-11-20",
-    },
-]
 
 
 @app.get("/projects")
 def get_projects():
-    return PROJECTS
+  return PROJECTS
 
 
 @app.post("/projects")
 def add_project(project: dict = Body(...)):
-    try:
-        new_id = max(p["id"] for p in PROJECTS) + 1 if PROJECTS else 1
-        new_proj = project
-        new_proj["id"] = new_id
-        new_proj["files"] = []
-        new_proj["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-        PROJECTS.append(new_proj)
-        print("✅ 새 과제 등록:", new_proj)
-        return {"message": "과제 등록 완료", "project": new_proj}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"등록 실패: {str(e)}")
+  try:
+    new_id = max(p["id"] for p in PROJECTS) + 1 if PROJECTS else 1
+    new_proj = project
+    new_proj["id"] = new_id
+    new_proj["files"] = []
+    new_proj["last_updated"] = datetime.now().strftime("%Y-%m-%d")
+    PROJECTS.append(new_proj)
+    print("✅ 새 과제 등록:", new_proj)
+    return {"message": "과제 등록 완료", "project": new_proj}
+  except Exception as e:
+    raise HTTPException(status_code=400, detail=f"등록 실패: {str(e)}")
 
 
 @app.put("/projects/{project_id}")
 def update_project(project_id: int, project: dict = Body(...)):
-    for p in PROJECTS:
-        if p["id"] == project_id:
-            p.update(project)
-            p["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-            return {"message": "과제 수정 완료", "project": p}
-    raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+  for p in PROJECTS:
+    if p["id"] == project_id:
+      p.update(project)
+      p["last_updated"] = datetime.now().strftime("%Y-%m-%d")
+      return {"message": "과제 수정 완료", "project": p}
+  raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
 
 
 @app.delete("/projects/{project_id}")
 def delete_project(project_id: int):
-    global PROJECTS
-    before = len(PROJECTS)
-    PROJECTS = [p for p in PROJECTS if p["id"] != project_id]
-    if len(PROJECTS) < before:
-        return {"message": f"ID {project_id} 과제 삭제 완료"}
-    raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+  global PROJECTS
+  before = len(PROJECTS)
+  PROJECTS = [p for p in PROJECTS if p["id"] != project_id]
+  if len(PROJECTS) < before:
+    return {"message": f"ID {project_id} 과제 삭제 완료"}
+  raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
 
 
 @app.post("/projects/{project_id}/upload")
 async def upload_project_file(project_id: int, file: UploadFile = File(...)):
-    project = next((p for p in PROJECTS if p["id"] == project_id), None)
-    if not project:
-        raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+  project = next((p for p in PROJECTS if p["id"] == project_id), None)
+  if not project:
+    raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
 
-    proj_dir = os.path.join(UPLOAD_DIR, f"project_{project_id}")
-    os.makedirs(proj_dir, exist_ok=True)
+  proj_dir = os.path.join(UPLOAD_DIR, f"project_{project_id}")
+  os.makedirs(proj_dir, exist_ok=True)
 
-    file_path = os.path.join(proj_dir, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+  file_path = os.path.join(proj_dir, file.filename)
+  with open(file_path, "wb") as buffer:
+    shutil.copyfileobj(file.file, buffer)
 
-    project["files"].append(file.filename)
-    project["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-    return {"message": "파일 업로드 완료", "filename": file.filename}
+  project["files"].append(file.filename)
+  project["last_updated"] = datetime.now().strftime("%Y-%m-%d")
+  return {"message": "파일 업로드 완료", "filename": file.filename}
 
 
 @app.get("/projects/{project_id}/files")
 def list_project_files(project_id: int):
-    project = next((p for p in PROJECTS if p["id"] == project_id), None)
-    if not project:
-        raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
-    return project["files"]
+  project = next((p for p in PROJECTS if p["id"] == project_id), None)
+  if not project:
+    raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+  return project["files"]
 
+
+# =========================
+# DB 생성
+# =========================
 
 Base.metadata.create_all(bind=engine)
