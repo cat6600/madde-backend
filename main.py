@@ -1536,88 +1536,145 @@ def delete_investment(investment_id: int):
     finally:
         db.close()
 
-
 # =========================
 # 9. 과제 데이터 (임시, 메모리 기반) – TODO: 향후 DB 테이블로 이관
 # =========================
 
 class ProjectBase(BaseModel):
-  title: str
-  organization: Optional[str] = None
-  type: Optional[str] = None
-  period: Optional[str] = None
-  budget: Optional[float] = 0.0
-  status: Optional[str] = None
-  due_date: Optional[str] = None
-  participants: Optional[str] = None
+    title: str
+    organization: Optional[str] = None
+    type: Optional[str] = None
+    period: Optional[str] = None
+    budget: Optional[float] = 0.0
+    status: Optional[str] = None
+    due_date: Optional[str] = None
+    participants: Optional[str] = None
 
 
+# 간단한 데모/임시 용도. 서버 재시작 시 초기화됨.
+PROJECTS: list[dict] = [
+    {
+        "id": 1,
+        "title": "고성능 세라믹 소재 개발",
+        "organization": "산업통상자원부",
+        "type": "R&D",
+        "period": "2024-01-01 ~ 2026-12-31",
+        "budget": 15.0,
+        "status": "진행중",
+        "due_date": "2024-01-10",
+        "participants": "김철수, 박민수, 이영희",
+        "files": ["세라믹_계획서.pdf"],
+        "last_updated": "2025-11-27",
+    },
+    {
+        "id": 2,
+        "title": "신제품 사업화 지원",
+        "organization": "중소벤처기업부",
+        "type": "사업화",
+        "period": "2024-07-01 ~ 2025-06-30",
+        "budget": 5.0,
+        "status": "신청예정",
+        "due_date": "2024-06-01",
+        "participants": "이영희, 정다운",
+        "files": [],
+        "last_updated": "2025-11-20",
+    },
+]
 
 
 @app.get("/projects")
 def get_projects():
-  return PROJECTS
+    """
+    과제 현황 페이지용 – 메모리 기반 PROJECTS 리스트 그대로 반환.
+    """
+    return PROJECTS
 
 
 @app.post("/projects")
 def add_project(project: dict = Body(...)):
-  try:
-    new_id = max(p["id"] for p in PROJECTS) + 1 if PROJECTS else 1
-    new_proj = project
-    new_proj["id"] = new_id
-    new_proj["files"] = []
-    new_proj["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-    PROJECTS.append(new_proj)
-    print("✅ 새 과제 등록:", new_proj)
-    return {"message": "과제 등록 완료", "project": new_proj}
-  except Exception as e:
-    raise HTTPException(status_code=400, detail=f"등록 실패: {str(e)}")
+    """
+    새 과제 추가 – body는 프론트에서 보내는 dict 그대로 사용.
+    """
+    try:
+        new_id = max(p["id"] for p in PROJECTS) + 1 if PROJECTS else 1
+        new_proj = dict(project)
+        new_proj["id"] = new_id
+        # 기본 필드 보정
+        new_proj.setdefault("files", [])
+        new_proj["last_updated"] = datetime.now().strftime("%Y-%m-%d")
+        PROJECTS.append(new_proj)
+        print("✅ 새 과제 등록:", new_proj)
+        return {"message": "과제 등록 완료", "project": new_proj}
+    except Exception as e:
+        print("❌ /projects add_project error:", repr(e))
+        raise HTTPException(status_code=400, detail=f"등록 실패: {str(e)}")
 
 
 @app.put("/projects/{project_id}")
 def update_project(project_id: int, project: dict = Body(...)):
-  for p in PROJECTS:
-    if p["id"] == project_id:
-      p.update(project)
-      p["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-      return {"message": "과제 수정 완료", "project": p}
-  raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+    """
+    과제 수정 – project_id에 해당하는 항목을 project dict로 업데이트.
+    """
+    try:
+        for p in PROJECTS:
+            if p["id"] == project_id:
+                p.update(project)
+                p["last_updated"] = datetime.now().strftime("%Y-%m-%d")
+                print("✏️ 과제 수정:", p)
+                return {"message": "과제 수정 완료", "project": p}
+        raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("❌ /projects update_project error:", repr(e))
+        raise HTTPException(status_code=400, detail=f"수정 실패: {str(e)}")
 
 
 @app.delete("/projects/{project_id}")
 def delete_project(project_id: int):
-  global PROJECTS
-  before = len(PROJECTS)
-  PROJECTS = [p for p in PROJECTS if p["id"] != project_id]
-  if len(PROJECTS) < before:
-    return {"message": f"ID {project_id} 과제 삭제 완료"}
-  raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+    """
+    과제 삭제 – PROJECTS 리스트에서 id가 project_id인 항목 제거.
+    """
+    global PROJECTS
+    before = len(PROJECTS)
+    PROJECTS = [p for p in PROJECTS if p.get("id") != project_id]
+    if len(PROJECTS) < before:
+        print(f"🗑️ 과제 삭제: {project_id}")
+        return {"message": f"ID {project_id} 과제 삭제 완료"}
+    raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
 
 
 @app.post("/projects/{project_id}/upload")
 async def upload_project_file(project_id: int, file: UploadFile = File(...)):
-  project = next((p for p in PROJECTS if p["id"] == project_id), None)
-  if not project:
-    raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+    """
+    각 과제별 파일 업로드 (임시, uploads/project_{id}/ 디렉터리에 저장)
+    """
+    project = next((p for p in PROJECTS if p.get("id") == project_id), None)
+    if not project:
+        raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
 
-  proj_dir = os.path.join(UPLOAD_DIR, f"project_{project_id}")
-  os.makedirs(proj_dir, exist_ok=True)
+    proj_dir = os.path.join(UPLOAD_DIR, f"project_{project_id}")
+    os.makedirs(proj_dir, exist_ok=True)
 
-  file_path = os.path.join(proj_dir, file.filename)
-  with open(file_path, "wb") as buffer:
-    shutil.copyfileobj(file.file, buffer)
+    file_path = os.path.join(proj_dir, file.filename)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
-  project["files"].append(file.filename)
-  project["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-  return {"message": "파일 업로드 완료", "filename": file.filename}
+    # files 필드에 파일명 추가
+    if "files" not in project or not isinstance(project["files"], list):
+        project["files"] = []
+    project["files"].append(file.filename)
+    project["last_updated"] = datetime.now().strftime("%Y-%m-%d")
+
+    return {"message": "파일 업로드 완료", "filename": file.filename}
 
 
 @app.get("/projects/{project_id}/files")
 def list_project_files(project_id: int):
-  project = next((p for p in PROJECTS if p["id"] == project_id), None)
-  if not project:
-    raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
-  return project["files"]
+    project = next((p for p in PROJECTS if p.get("id") == project_id), None)
+    if not project:
+        raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+    return project.get("files", [])
 
 
 # =========================
