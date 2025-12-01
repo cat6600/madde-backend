@@ -1,20 +1,17 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import create_engine, Column, Integer, String, Float
-from typing import List, Optional, Dict
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime
 import shutil, os, re
 
 app = FastAPI()
 
 # ✅ CORS 설정
-#   - 지금은 편의를 위해 모든 origin 허용 ("*")
-#   - 보안 강화하려면 나중에 정확한 도메인만 남겨두면 됨.
 origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
@@ -31,6 +28,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # IR 전용 폴더 (uploads/ir)
 IR_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "ir")
 os.makedirs(IR_UPLOAD_DIR, exist_ok=True)
+
+# ✅ 공정 데이터(CAD 등) 전용 폴더
+PROCESS_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "process")
+os.makedirs(PROCESS_UPLOAD_DIR, exist_ok=True)
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/project_uploads", StaticFiles(directory=UPLOAD_DIR), name="project_uploads")
@@ -131,6 +132,58 @@ class Investment(Base):
     security_type = Column(String)     # 종류 (RCPS, 보통주 등)
 
 
+# ✅ 공정 데이터 - 견적/발주 현황 테이블
+class ProcessOrder(Base):
+    __tablename__ = "process_orders"
+    id = Column(Integer, primary_key=True)
+    company_name = Column(String, nullable=False)          # 업체명
+    quote_date = Column(String, nullable=False)            # 견적일 (YYYY-MM-DD)
+    category = Column(String, nullable=False)              # 구분 (RSiC, RBSC 등)
+    product_name = Column(String, nullable=False)          # 품명
+    quantity = Column(Integer, nullable=False)             # 수량
+    unit_manufacturing_cost = Column(Integer, nullable=False)  # 제조원가(개당)
+    unit_quote_price = Column(Integer, nullable=False)     # 개당 견적가
+    total_quote_price = Column(Integer, nullable=False)    # 총 견적가
+    status = Column(String, nullable=False)                # 상태 (견적중/발주/완료 등)
+    actual_order_amount = Column(Integer)                  # 실제 발주금액
+    margin_rate = Column(Float)                            # 마진율(%)
+    related_file = Column(String)                          # 관련 파일명/경로
+
+
+# ✅ 공정 데이터 - 주문별 공정 상태
+class ProcessOrderStatus(Base):
+    __tablename__ = "process_order_status"
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey("process_orders.id"), nullable=False)
+    total_process_time_hours = Column(Float)   # 총 공정시간(hr)
+    current_stage = Column(String)            # 현 공정 단계
+    progress_percent = Column(Float)          # 진행율(%)
+    current_detail = Column(String)           # 현 상황(상세)
+    priority = Column(String)                 # 우선순위 (매우시급/시급/보통/양호/여유)
+
+
+# ✅ 공정 데이터 - 단가 테이블
+class UnitCost(Base):
+    __tablename__ = "unit_costs"
+    id = Column(String, primary_key=True)     # M01, G01 등
+    category = Column(String, nullable=False) # 재료비/장비비/인건비 등
+    item_name = Column(String, nullable=False)
+    unit_price = Column(Float, nullable=False)
+    unit = Column(String, nullable=False)     # KRW/g, KRW/hr ...
+    note = Column(String)                     # 비고
+
+
+# ✅ 공정 데이터 - 제품별 Raw Tracking 테이블
+class ProcessTracking(Base):
+    __tablename__ = "process_tracking"
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey("process_orders.id"), nullable=False)
+    product_volume_cm3 = Column(Float)   # 제품 부피
+    printing_time_hr = Column(Float)     # 프린팅 시간
+    bed_density = Column(Float)         # 베드 밀도
+    note = Column(String)
+
+
 # =========================
 # 2. 로그인 (내부용 간단 로그인)
 # =========================
@@ -138,14 +191,12 @@ class Investment(Base):
 ADMIN_PASSWORD = "aodlem0627@"
 VIEWER_PASSWORD = "madde-viewer"
 
+
 @app.post("/login")
 def login(username: str = Form(...), password: str = Form(...)):
     """
     매우 단순한 내부용 로그인:
     - username: "admin" 또는 "viewer" (프론트에서 role로 보냄)
-    - password:
-        admin  → madde-admin
-        viewer → madde-viewer
     """
     if username == "admin" and password == ADMIN_PASSWORD:
         return {"message": "로그인 성공", "role": "admin"}
@@ -639,7 +690,312 @@ def get_assets():
 
 
 # =========================
-# 7. 재무 / 투자 현황
+# 7. 공정 데이터 API
+# =========================
+
+class ProcessOrderSchema(BaseModel):
+    id: Optional[int] = None
+    company_name: str
+    quote_date: str
+    category: str
+    product_name: str
+    quantity: int
+    unit_manufacturing_cost: int
+    unit_quote_price: int
+    total_quote_price: int
+    status: str
+    actual_order_amount: Optional[int] = None
+    margin_rate: Optional[float] = None
+    related_file: Optional[str] = None
+
+
+class ProcessOrderStatusSchema(BaseModel):
+    id: Optional[int] = None
+    order_id: int
+    total_process_time_hours: Optional[float] = None
+    current_stage: Optional[str] = None
+    progress_percent: Optional[float] = None
+    current_detail: Optional[str] = None
+    priority: Optional[str] = None
+
+
+class UnitCostSchema(BaseModel):
+    id: str
+    category: str
+    item_name: str
+    unit_price: float
+    unit: str
+    note: Optional[str] = None
+
+
+class ProcessTrackingSchema(BaseModel):
+    id: Optional[int] = None
+    order_id: int
+    product_volume_cm3: Optional[float] = None
+    printing_time_hr: Optional[float] = None
+    bed_density: Optional[float] = None
+    note: Optional[str] = None
+
+
+# ---- 견적/발주 현황 ----
+@app.get("/process/orders", response_model=List[ProcessOrderSchema])
+def get_process_orders():
+    db = SessionLocal()
+    try:
+        rows = db.query(ProcessOrder).order_by(
+            ProcessOrder.quote_date.desc(), ProcessOrder.id.desc()
+        ).all()
+        return rows
+    finally:
+        db.close()
+
+
+@app.post("/process/orders", response_model=ProcessOrderSchema)
+async def create_process_order(
+    company_name: str = Form(...),
+    quote_date: str = Form(...),
+    category: str = Form(...),             # RBSC / RSiC / WAAM / 기타
+    product_name: str = Form(...),
+    quantity: int = Form(...),
+    manufacturing_cost: int = Form(...),   # ✅ 전체 제조원가
+    total_quote_price: int = Form(...),    # ✅ 전체 견적가
+    status: str = Form(...),               # 견적중 / 진행중 / 발주완료 / 미진행
+    actual_order_amount: Optional[int] = Form(None),
+    file: Optional[UploadFile] = File(None),  # CAD 등 파일
+):
+    db = SessionLocal()
+    try:
+        # 🔹 파일 업로드 처리
+        stored_name = None
+        if file is not None:
+            safe = re.sub(r"[^A-Za-z0-9_.-]", "_", file.filename)
+            stored_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe}"
+            file_path = os.path.join(PROCESS_UPLOAD_DIR, stored_name)
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+        # 🔹 개당 견적가 = 전체 견적가 / 수량
+        unit_quote_price = int(total_quote_price / quantity) if quantity else 0
+
+        # 🔹 마진율 = (전체 견적가 - 제조원가) / 전체 견적가 * 100
+        margin_rate = None
+        if total_quote_price > 0:
+            margin_rate = (
+                (total_quote_price - manufacturing_cost)
+                / total_quote_price
+                * 100.0
+            )
+
+        obj = ProcessOrder(
+            company_name=company_name,
+            quote_date=quote_date,
+            category=category,
+            product_name=product_name,
+            quantity=quantity,
+            # DB 컬럼 이름은 그대로 쓰되, 의미는 "전체 제조원가"로 사용
+            unit_manufacturing_cost=manufacturing_cost,
+            # DB에 개당 견적가 저장
+            unit_quote_price=unit_quote_price,
+            # DB에 전체 견적가 저장
+            total_quote_price=total_quote_price,
+            status=status,
+            actual_order_amount=actual_order_amount,
+            margin_rate=margin_rate,
+            related_file=stored_name,  # 업로드된 파일명
+        )
+        db.add(obj)
+        db.commit()
+        db.refresh(obj)
+        return obj
+    finally:
+        db.close()
+
+
+# ---- 공정 상태 ----
+@app.get("/process/orders/{order_id}/status", response_model=List[ProcessOrderStatusSchema])
+def get_order_status(order_id: int):
+    db = SessionLocal()
+    try:
+        rows = db.query(ProcessOrderStatus).filter(
+            ProcessOrderStatus.order_id == order_id
+        ).all()
+        return rows
+    finally:
+        db.close()
+
+
+@app.post("/process/orders/{order_id}/status", response_model=ProcessOrderStatusSchema)
+def create_or_update_order_status(order_id: int, payload: ProcessOrderStatusSchema):
+    db = SessionLocal()
+    try:
+        # 단일 레코드만 관리한다고 가정하고, 있으면 업데이트 / 없으면 생성
+        existing = (
+            db.query(ProcessOrderStatus)
+            .filter(ProcessOrderStatus.order_id == order_id)
+            .first()
+        )
+
+        if existing:
+            existing.total_process_time_hours = payload.total_process_time_hours
+            existing.current_stage = payload.current_stage
+            existing.progress_percent = payload.progress_percent
+            existing.current_detail = payload.current_detail
+            existing.priority = payload.priority
+            db.commit()
+            db.refresh(existing)
+            return existing
+
+        obj = ProcessOrderStatus(
+            order_id=order_id,
+            total_process_time_hours=payload.total_process_time_hours,
+            current_stage=payload.current_stage,
+            progress_percent=payload.progress_percent,
+            current_detail=payload.current_detail,
+            priority=payload.priority,
+        )
+        db.add(obj)
+        db.commit()
+        db.refresh(obj)
+        return obj
+    finally:
+        db.close()
+
+
+# ---- 단가 테이블 ----
+@app.get("/process/unit-costs", response_model=List[UnitCostSchema])
+def get_unit_costs():
+    db = SessionLocal()
+    try:
+        rows = db.query(UnitCost).order_by(UnitCost.id).all()
+        return rows
+    finally:
+        db.close()
+
+
+@app.post("/process/unit-costs", response_model=UnitCostSchema)
+def create_unit_cost(cost: UnitCostSchema):
+    db = SessionLocal()
+    try:
+        if db.query(UnitCost).filter(UnitCost.id == cost.id).first():
+            raise HTTPException(status_code=400, detail="이미 존재하는 ID입니다.")
+        obj = UnitCost(
+            id=cost.id,
+            category=cost.category,
+            item_name=cost.item_name,
+            unit_price=cost.unit_price,
+            unit=cost.unit,
+            note=cost.note,
+        )
+        db.add(obj)
+        db.commit()
+        db.refresh(obj)
+        return obj
+    finally:
+        db.close()
+
+
+@app.put("/process/unit-costs/{unit_id}", response_model=UnitCostSchema)
+def update_unit_cost(unit_id: str, cost: UnitCostSchema):
+    db = SessionLocal()
+    try:
+        obj = db.query(UnitCost).filter(UnitCost.id == unit_id).first()
+        if not obj:
+            raise HTTPException(status_code=404, detail="단가 정보를 찾을 수 없습니다.")
+
+        obj.category = cost.category
+        obj.item_name = cost.item_name
+        obj.unit_price = cost.unit_price
+        obj.unit = cost.unit
+        obj.note = cost.note
+
+        db.commit()
+        db.refresh(obj)
+        return obj
+    finally:
+        db.close()
+
+
+@app.delete("/process/unit-costs/{unit_id}")
+def delete_unit_cost(unit_id: str):
+    db = SessionLocal()
+    try:
+        obj = db.query(UnitCost).filter(UnitCost.id == unit_id).first()
+        if not obj:
+            raise HTTPException(status_code=404, detail="단가 정보를 찾을 수 없습니다.")
+        db.delete(obj)
+        db.commit()
+        return {"message": "단가 정보 삭제 완료 ✅"}
+    finally:
+        db.close()
+
+
+# ---- 공정 Raw Tracking ----
+@app.get("/process/trackings", response_model=List[ProcessTrackingSchema])
+def get_trackings():
+    db = SessionLocal()
+    try:
+        rows = db.query(ProcessTracking).all()
+        return rows
+    finally:
+        db.close()
+
+
+@app.post("/process/trackings", response_model=ProcessTrackingSchema)
+def create_tracking(tr: ProcessTrackingSchema):
+    db = SessionLocal()
+    try:
+        obj = ProcessTracking(
+            order_id=tr.order_id,
+            product_volume_cm3=tr.product_volume_cm3,
+            printing_time_hr=tr.printing_time_hr,
+            bed_density=tr.bed_density,
+            note=tr.note,
+        )
+        db.add(obj)
+        db.commit()
+        db.refresh(obj)
+        return obj
+    finally:
+        db.close()
+
+
+@app.put("/process/trackings/{tracking_id}", response_model=ProcessTrackingSchema)
+def update_tracking(tracking_id: int, tr: ProcessTrackingSchema):
+    db = SessionLocal()
+    try:
+        obj = db.query(ProcessTracking).filter(ProcessTracking.id == tracking_id).first()
+        if not obj:
+            raise HTTPException(status_code=404, detail="추적 데이터를 찾을 수 없습니다.")
+
+        obj.order_id = tr.order_id
+        obj.product_volume_cm3 = tr.product_volume_cm3
+        obj.printing_time_hr = tr.printing_time_hr
+        obj.bed_density = tr.bed_density
+        obj.note = tr.note
+
+        db.commit()
+        db.refresh(obj)
+        return obj
+    finally:
+        db.close()
+
+
+@app.delete("/process/trackings/{tracking_id}")
+def delete_tracking(tracking_id: int):
+    db = SessionLocal()
+    try:
+        obj = db.query(ProcessTracking).filter(ProcessTracking.id == tracking_id).first()
+        if not obj:
+            raise HTTPException(status_code=404, detail="추적 데이터를 찾을 수 없습니다.")
+        db.delete(obj)
+        db.commit()
+        return {"message": "추적 데이터 삭제 완료 ✅"}
+    finally:
+        db.close()
+
+
+# =========================
+# 8. 재무 / 투자 현황
 # =========================
 
 @app.get("/investments")
@@ -728,7 +1084,7 @@ def delete_investment(investment_id: int):
 
 
 # =========================
-# 8. 과제 데이터 (임시, 메모리 기반)
+# 9. 과제 데이터 (임시, 메모리 기반)
 # =========================
 
 class ProjectBase(BaseModel):
