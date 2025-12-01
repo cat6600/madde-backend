@@ -554,7 +554,6 @@ def delete_ir(ir_id: int):
     finally:
         db.close()
 
-
 # =========================
 # 6. 인건비 / 현물 현황
 # =========================
@@ -722,120 +721,162 @@ def update_equipment_shares(equipment_id: int, payload: ShareUpdate):
     finally:
         db.close()
 
-
 def get_active_project_titles():
     """
     현재 메모리 기반 PROJECTS 리스트에서
     status가 진행중/신청완료인 과제 제목만 가져옴.
+    PROJECTS가 정의되어 있지 않아도 빈 리스트를 반환하도록 방어적으로 작성.
     (향후 DB 기반으로 이관 예정)
     """
     active_status = {"진행중", "신청완료"}
-    titles = [
-        p["title"]
-        for p in PROJECTS
-        if p.get("status") in active_status
-    ]
-    return list(dict.fromkeys(titles))
+
+    # PROJECTS가 아직 정의 안 되어 있으면 그냥 빈 리스트 반환
+    projects = globals().get("PROJECTS", [])
+    if not isinstance(projects, list):
+        return []
+
+    titles: list[str] = []
+    for p in projects:
+        try:
+            if p.get("status") in active_status:
+                titles.append(p.get("title", ""))
+        except Exception:
+            continue
+
+    # 중복 + 공백 제거
+    return list(dict.fromkeys([t for t in titles if t]))
+
 
 
 @app.get("/assets")
 def get_assets():
-    db = SessionLocal()
+    """
+    현물 현황 페이지용 API
+    - projects: 현재 진행/신청완료 과제 목록 (메모리 기반 PROJECTS)
+    - personnel_rows: 인건비(사람) 배분 현황
+    - equipment_rows: 장비/현물 배분 현황
+    에러가 나더라도 500 대신 빈 구조를 반환해서 프론트가 죽지 않도록 방어적으로 작성.
+    """
+    # 에러 발생 시 프론트에 줄 기본 구조
+    empty_result = {
+        "projects": [],
+        "personnel_rows": [],
+        "personnel_salary_total": 0,
+        "personnel_grand_total": 0,
+        "equipment_rows": [],
+        "equipment_acquisition_total": 0,
+        "equipment_grand_total": 0,
+    }
+
+    # DB 조회
     try:
+        db = SessionLocal()
         people = db.query(Personnel).all()
         person_shares = db.query(PersonnelProjectShare).all()
         equipments = db.query(Equipment).all()
         equip_shares = db.query(EquipmentProjectShare).all()
+    except Exception as e:
+        print("❌ /assets DB error:", repr(e))
+        return empty_result
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
-    active_projects = get_active_project_titles()
+    try:
+        active_projects = get_active_project_titles()
 
-    person_share_map: Dict[int, Dict[str, float]] = {}
-    for s in person_shares:
-        if s.project_title not in active_projects:
-            continue
-        if s.personnel_id not in person_share_map:
-            person_share_map[s.personnel_id] = {}
-        person_share_map[s.personnel_id][s.project_title] = float(s.percent or 0)
+        # --- 인건비(사람) 계산 ---
+        person_share_map: Dict[int, Dict[str, float]] = {}
+        for s in person_shares:
+            if s.project_title not in active_projects:
+                continue
+            if s.personnel_id not in person_share_map:
+                person_share_map[s.personnel_id] = {}
+            person_share_map[s.personnel_id][s.project_title] = float(s.percent or 0)
 
-    personnel_rows = []
-    personnel_salary_total = 0.0
-    personnel_grand_total = 0.0
+        personnel_rows = []
+        personnel_salary_total = 0.0
+        personnel_grand_total = 0.0
 
-    for person in people:
-        proj_shares = {title: 0.0 for title in active_projects}
-        if person.id in person_share_map:
-            for title, val in person_share_map[person.id].items():
-                if title in proj_shares:
-                    proj_shares[title] = val
+        for person in people:
+            proj_shares = {title: 0.0 for title in active_projects}
+            if person.id in person_share_map:
+                for title, val in person_share_map[person.id].items():
+                    if title in proj_shares:
+                        proj_shares[title] = val
 
-        total_percent = sum(proj_shares.values())
-        salary = float(person.salary or 0)
-        total_amount = salary * (total_percent / 100.0)
+            total_percent = sum(proj_shares.values())
+            salary = float(person.salary or 0)
+            total_amount = salary * (total_percent / 100.0)
 
-        personnel_salary_total += salary
-        personnel_grand_total += total_amount
+            personnel_salary_total += salary
+            personnel_grand_total += total_amount
 
-        personnel_rows.append(
-            {
-                "person_id": person.id,
-                "name": person.name,
-                "department": person.department,
-                "salary": person.salary,
-                "shares": proj_shares,
-                "total_percent": total_percent,
-                "total_amount": int(total_amount),
-            }
-        )
+            personnel_rows.append(
+                {
+                    "person_id": person.id,
+                    "name": person.name,
+                    "department": person.department,
+                    "salary": person.salary,
+                    "shares": proj_shares,
+                    "total_percent": total_percent,
+                    "total_amount": int(total_amount),
+                }
+            )
 
-    equip_share_map: Dict[int, Dict[str, float]] = {}
-    for s in equip_shares:
-        if s.project_title not in active_projects:
-            continue
-        if s.equipment_id not in equip_share_map:
-            equip_share_map[s.equipment_id] = {}
-        equip_share_map[s.equipment_id][s.project_title] = float(s.percent or 0)
+        # --- 장비(현물) 계산 ---
+        equip_share_map: Dict[int, Dict[str, float]] = {}
+        for s in equip_shares:
+            if s.project_title not in active_projects:
+                continue
+            if s.equipment_id not in equip_share_map:
+                equip_share_map[s.equipment_id] = {}
+            equip_share_map[s.equipment_id][s.project_title] = float(s.percent or 0)
 
-    equipment_rows = []
-    equipment_acquisition_total = 0.0
-    equipment_grand_total = 0.0
+        equipment_rows = []
+        equipment_acquisition_total = 0.0
+        equipment_grand_total = 0.0
 
-    for eq in equipments:
-        proj_shares = {title: 0.0 for title in active_projects}
-        if eq.id in equip_share_map:
-            for title, val in equip_share_map[eq.id].items():
-                if title in proj_shares:
-                    proj_shares[title] = val
+        for eq in equipments:
+            proj_shares = {title: 0.0 for title in active_projects}
+            if eq.id in equip_share_map:
+                for title, val in equip_share_map[eq.id].items():
+                    if title in proj_shares:
+                        proj_shares[title] = val
 
-        total_percent = sum(proj_shares.values())
-        cost = float(eq.acquisition_cost or 0)
-        total_amount = cost * (total_percent / 100.0)
+            total_percent = sum(proj_shares.values())
+            cost = float(eq.acquisition_cost or 0)
+            total_amount = cost * (total_percent / 100.0)
 
-        equipment_acquisition_total += cost
-        equipment_grand_total += total_amount
+            equipment_acquisition_total += cost
+            equipment_grand_total += total_amount
 
-        equipment_rows.append(
-            {
-                "equipment_id": eq.id,
-                "name": eq.name,
-                "acquisition_cost": eq.acquisition_cost,
-                "acquisition_date": eq.acquisition_date,
-                "shares": proj_shares,
-                "total_percent": total_percent,
-                "total_amount": int(total_amount),
-            }
-        )
+            equipment_rows.append(
+                {
+                    "equipment_id": eq.id,
+                    "name": eq.name,
+                    "acquisition_cost": eq.acquisition_cost,
+                    "acquisition_date": eq.acquisition_date,
+                    "shares": proj_shares,
+                    "total_percent": total_percent,
+                    "total_amount": int(total_amount),
+                }
+            )
 
-    return {
-        "projects": active_projects,
-        "personnel_rows": personnel_rows,
-        "personnel_salary_total": int(personnel_salary_total),
-        "personnel_grand_total": int(personnel_grand_total),
-        "equipment_rows": equipment_rows,
-        "equipment_acquisition_total": int(equipment_acquisition_total),
-        "equipment_grand_total": int(equipment_grand_total),
-    }
+        return {
+            "projects": active_projects,
+            "personnel_rows": personnel_rows,
+            "personnel_salary_total": int(personnel_salary_total),
+            "personnel_grand_total": int(personnel_grand_total),
+            "equipment_rows": equipment_rows,
+            "equipment_acquisition_total": int(equipment_acquisition_total),
+            "equipment_grand_total": int(equipment_grand_total),
+        }
+    except Exception as e:
+        print("❌ /assets calc error:", repr(e))
+        return empty_result
 
 
 # =========================
