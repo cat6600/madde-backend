@@ -8,7 +8,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -183,8 +183,8 @@ class Investment(Base):
     round = Column(String)             # 라운드 (Pre-A, Series A 등)
     contract_date = Column(String)     # 계약일 (YYYY-MM-DD)
     registration_date = Column(String) # 등기일 (YYYY-MM-DD)
-    shares = Column(Integer)           # 주식수
-    amount = Column(Integer)           # 투자금 (원 또는 천원 단위)
+    shares = Column(BigInteger)           # 주식수
+    amount = Column(BigInteger)           # 투자금 (원 또는 천원 단위)
     investor = Column(String)          # 투자사
     security_type = Column(String)     # 종류 (RCPS, 보통주 등)
 
@@ -1561,12 +1561,12 @@ def get_investments():
 @app.post("/investments")
 def add_investment(
     round: str = Form(...),
-    contract_date: str = Form(...),
-    registration_date: str = Form(...),
-    shares: int = Form(...),
-    amount: int = Form(...),
-    investor: str = Form(...),
-    security_type: str = Form(...),
+    contract_date: str = Form(""),
+    registration_date: str = Form(""),
+    shares: int = Form(0),
+    amount: int = Form(0),
+    investor: str = Form(""),
+    security_type: str = Form(""),
 ):
     db = SessionLocal()
     try:
