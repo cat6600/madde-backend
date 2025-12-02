@@ -1,13 +1,32 @@
+import os
+import re
+import shutil
+from datetime import datetime
+from typing import List, Optional, Dict
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from pydantic import BaseModel
-from typing import List, Optional, Dict
-from datetime import datetime
-import shutil, os, re
+from supabase import create_client
+
+# =========================
+# 0. Supabase 클라이언트 초기화 (Step 5)
+# =========================
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+supabase = None
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    print("✅ Supabase client initialized")
+else:
+    print("⚠️ Supabase env(SUPABASE_URL / SUPABASE_SERVICE_KEY)가 설정되지 않았습니다. "
+          "(현재는 파일을 로컬 /uploads에만 저장 중입니다.)")
 
 app = FastAPI()
 
@@ -21,7 +40,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ 업로드 폴더 설정
+# ✅ 업로드 폴더 설정 (현재는 아직 로컬 파일 사용 중 – 추후 Supabase로 교체 예정)
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -40,10 +59,25 @@ os.makedirs(PROCESS_UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/project_uploads", StaticFiles(directory=UPLOAD_DIR), name="project_uploads")
 
-# ✅ 데이터베이스 설정
-DATABASE_URL = "sqlite:///./madde.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(bind=engine)
+# =========================
+# DB 설정 (Postgres + SQLite fallback)
+# =========================
+
+# Render에서는 DATABASE_URL이 Postgres(madde-db)로 들어 있고,
+# 로컬 개발에서는 없으면 SQLite를 사용하도록 한다.
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./madde.db")
+
+if DATABASE_URL.startswith("sqlite"):
+    # 로컬 개발용 SQLite
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+    )
+else:
+    # Render Postgres 등
+    engine = create_engine(DATABASE_URL)
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
 
@@ -226,6 +260,30 @@ class ProcessTime(Base):
     total_cost = Column(Float, default=0)       # 총 제조원가
 
 
+# ✅ 과제(프로젝트) 테이블 – 기존 PROJECTS 메모리 대체
+class Project(Base):
+    __tablename__ = "projects"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)         # 과제명
+    organization = Column(String)                  # 주관기관
+    type = Column(String)                          # 사업 유형
+    period = Column(String)                        # 기간 텍스트 (예: 2025.01~2027.12)
+    budget = Column(Float)                         # 총 예산
+    status = Column(String)                        # 진행중 / 신청완료 / 종료 등
+    due_date = Column(String)                      # 마감일
+    participants = Column(String)                  # 참여자 텍스트
+    last_updated = Column(String)                  # 마지막 업데이트 날짜(YYYY-MM-DD)
+
+
+# ✅ 과제별 파일 테이블
+class ProjectFile(Base):
+    __tablename__ = "project_files"
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    filename = Column(String, nullable=False)      # 실제 저장된 파일명(현재는 original 그대로)
+    upload_date = Column(String)                   # YYYY-MM-DD
+
+
 # =========================
 # 2. 로그인 (내부용 간단 로그인)
 # =========================
@@ -273,7 +331,7 @@ async def upload_research(
 ):
     filename: Optional[str] = None
 
-    # 파일이 있는 경우에만 저장 처리
+    # 파일이 있는 경우에만 저장 처리 (현재는 로컬 /uploads – 추후 Supabase로 교체 예정)
     if file is not None:
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", file.filename)
         name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe}"
@@ -296,6 +354,29 @@ async def upload_research(
     db.commit()
     db.close()
     return {"message": "업로드 완료"}
+
+@app.delete("/research/{research_id}")
+def delete_research(research_id: int):
+    db = SessionLocal()
+    try:
+        rec = db.query(Research).filter(Research.id == research_id).first()
+        if not rec:
+            raise HTTPException(status_code=404, detail="해당 연구 데이터를 찾을 수 없습니다.")
+
+        # 파일 있으면 같이 삭제
+        if rec.filename:
+            file_path = os.path.join(UPLOAD_DIR, rec.filename)
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
+
+        db.delete(rec)
+        db.commit()
+        return {"message": "연구 데이터 삭제 완료 ✅"}
+    finally:
+        db.close()
 
 
 # =========================
@@ -347,7 +428,7 @@ def delete_ip(ip_id: int):
         if not ip:
             raise HTTPException(status_code=404, detail="해당 IP를 찾을 수 없습니다.")
 
-        # ✅ 해당 IP와 연결된 파일들도 같이 삭제
+        # ✅ 해당 IP와 연결된 파일들도 같이 삭제 (현재는 로컬 디스크 기준)
         files = db.query(IPFile).filter(IPFile.ip_id == ip_id).all()
         for f in files:
             file_path = os.path.join(IP_UPLOAD_DIR, f.stored_name)
@@ -452,7 +533,6 @@ def delete_ip_file(file_id: int):
         db.close()
 
 
-
 # =========================
 # 5. IR/마케팅 자료 관리
 # =========================
@@ -496,7 +576,7 @@ async def upload_ir(
     """
     saved_ids = []
 
-    # 폴더 경로 결정
+    # 폴더 경로 결정 (현재는 로컬 디스크)
     base_dir = IR_UPLOAD_DIR
     if folder:
         base_dir = os.path.join(IR_UPLOAD_DIR, folder)
@@ -537,6 +617,7 @@ async def upload_ir(
     finally:
         db.close()
 
+
 @app.delete("/ir/{ir_id}")
 def delete_ir(ir_id: int):
     db = SessionLocal()
@@ -561,6 +642,7 @@ def delete_ir(ir_id: int):
         return {"message": "IR 자료 삭제 완료 ✅"}
     finally:
         db.close()
+
 
 # =========================
 # 6. 인건비 / 현물 현황
@@ -729,43 +811,42 @@ def update_equipment_shares(equipment_id: int, payload: ShareUpdate):
     finally:
         db.close()
 
-def get_active_project_titles():
+
+def get_active_project_titles() -> List[str]:
     """
-    현재 메모리 기반 PROJECTS 리스트에서
+    현재 DB 기반 projects 테이블에서
     status가 진행중/신청완료인 과제 제목만 가져옴.
-    PROJECTS가 정의되어 있지 않아도 빈 리스트를 반환하도록 방어적으로 작성.
-    (향후 DB 기반으로 이관 예정)
     """
     active_status = {"진행중", "신청완료"}
-
-    # PROJECTS가 아직 정의 안 되어 있으면 그냥 빈 리스트 반환
-    projects = globals().get("PROJECTS", [])
-    if not isinstance(projects, list):
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Project)
+            .filter(Project.status.in_(list(active_status)))
+            .all()
+        )
+        titles = [r.title for r in rows if r.title]
+        # 중복 제거 + 순서 유지
+        return list(dict.fromkeys(titles))
+    except Exception as e:
+        print("❌ get_active_project_titles DB error:", repr(e))
         return []
-
-    titles: list[str] = []
-    for p in projects:
+    finally:
         try:
-            if p.get("status") in active_status:
-                titles.append(p.get("title", ""))
+            db.close()
         except Exception:
-            continue
-
-    # 중복 + 공백 제거
-    return list(dict.fromkeys([t for t in titles if t]))
-
+            pass
 
 
 @app.get("/assets")
 def get_assets():
     """
     현물 현황 페이지용 API
-    - projects: 현재 진행/신청완료 과제 목록 (메모리 기반 PROJECTS)
+    - projects: 현재 진행/신청완료 과제 목록 (DB 기반 projects 테이블)
     - personnel_rows: 인건비(사람) 배분 현황
     - equipment_rows: 장비/현물 배분 현황
     에러가 나더라도 500 대신 빈 구조를 반환해서 프론트가 죽지 않도록 방어적으로 작성.
     """
-    # 에러 발생 시 프론트에 줄 기본 구조
     empty_result = {
         "projects": [],
         "personnel_rows": [],
@@ -776,7 +857,6 @@ def get_assets():
         "equipment_grand_total": 0,
     }
 
-    # DB 조회
     try:
         db = SessionLocal()
         people = db.query(Personnel).all()
@@ -1022,7 +1102,7 @@ async def create_process_order(
 ):
     db = SessionLocal()
     try:
-        # 🔹 파일 업로드 처리
+        # 🔹 파일 업로드 처리 (현재는 로컬 디스크 – 추후 Supabase Storage로 변경 예정)
         stored_name = None
         if file is not None:
             safe = re.sub(r"[^A-Za-z0-9_.-]", "_", file.filename)
@@ -1544,8 +1624,9 @@ def delete_investment(investment_id: int):
     finally:
         db.close()
 
+
 # =========================
-# 9. 과제 데이터 (임시, 메모리 기반) – TODO: 향후 DB 테이블로 이관
+# 9. 과제 데이터 – DB 기반으로 변경
 # =========================
 
 class ProjectBase(BaseModel):
@@ -1559,102 +1640,208 @@ class ProjectBase(BaseModel):
     participants: Optional[str] = None
 
 
-PROJECTS: list[dict] = []
+def _project_to_dict(db: SessionLocal, proj: Project) -> dict:
+    """
+    Project + ProjectFile을 프론트에서 쓰던 dict 형태로 변환
+    (id, title, organization, ..., last_updated, files[])
+    """
+    files = (
+        db.query(ProjectFile)
+        .filter(ProjectFile.project_id == proj.id)
+        .all()
+    )
+    file_names = [f.filename for f in files]
+
+    return {
+        "id": proj.id,
+        "title": proj.title,
+        "organization": proj.organization,
+        "type": proj.type,
+        "period": proj.period,
+        "budget": proj.budget,
+        "status": proj.status,
+        "due_date": proj.due_date,
+        "participants": proj.participants,
+        "last_updated": proj.last_updated,
+        "files": file_names,
+    }
 
 
 @app.get("/projects")
 def get_projects():
     """
-    과제 현황 페이지용 – 메모리 기반 PROJECTS 리스트 그대로 반환.
+    과제 현황 페이지용 – DB 기반 projects + project_files
     """
-    return PROJECTS
+    db = SessionLocal()
+    try:
+        rows = db.query(Project).order_by(Project.id.asc()).all()
+        return [_project_to_dict(db, p) for p in rows]
+    finally:
+        db.close()
 
 
 @app.post("/projects")
 def add_project(project: dict = Body(...)):
     """
-    새 과제 추가 – body는 프론트에서 보내는 dict 그대로 사용.
+    새 과제 추가 – 기존과 동일하게 dict를 받고, DB에 저장.
     """
+    db = SessionLocal()
     try:
-        new_id = max(p["id"] for p in PROJECTS) + 1 if PROJECTS else 1
-        new_proj = dict(project)
-        new_proj["id"] = new_id
-        # 기본 필드 보정
-        new_proj.setdefault("files", [])
-        new_proj["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-        PROJECTS.append(new_proj)
-        print("✅ 새 과제 등록:", new_proj)
-        return {"message": "과제 등록 완료", "project": new_proj}
+        now_str = datetime.now().strftime("%Y-%m-%d")
+        title = project.get("title")
+        if not title:
+            raise HTTPException(status_code=400, detail="title은 필수입니다.")
+
+        proj = Project(
+            title=title,
+            organization=project.get("organization"),
+            type=project.get("type"),
+            period=project.get("period"),
+            budget=project.get("budget") or 0.0,
+            status=project.get("status"),
+            due_date=project.get("due_date"),
+            participants=project.get("participants"),
+            last_updated=now_str,
+        )
+        db.add(proj)
+        db.commit()
+        db.refresh(proj)
+
+        proj_dict = _project_to_dict(db, proj)
+        print("✅ 새 과제 등록(DB):", proj_dict)
+        return {"message": "과제 등록 완료", "project": proj_dict}
+    except HTTPException:
+        raise
     except Exception as e:
         print("❌ /projects add_project error:", repr(e))
         raise HTTPException(status_code=400, detail=f"등록 실패: {str(e)}")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 @app.put("/projects/{project_id}")
 def update_project(project_id: int, project: dict = Body(...)):
     """
-    과제 수정 – project_id에 해당하는 항목을 project dict로 업데이트.
+    과제 수정 – project_id에 해당하는 DB row를 project dict로 업데이트.
     """
+    db = SessionLocal()
     try:
-        for p in PROJECTS:
-            if p["id"] == project_id:
-                p.update(project)
-                p["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-                print("✏️ 과제 수정:", p)
-                return {"message": "과제 수정 완료", "project": p}
-        raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+        proj = db.query(Project).filter(Project.id == project_id).first()
+        if not proj:
+            raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+
+        proj.title = project.get("title", proj.title)
+        proj.organization = project.get("organization", proj.organization)
+        proj.type = project.get("type", proj.type)
+        proj.period = project.get("period", proj.period)
+        proj.budget = project.get("budget", proj.budget)
+        proj.status = project.get("status", proj.status)
+        proj.due_date = project.get("due_date", proj.due_date)
+        proj.participants = project.get("participants", proj.participants)
+        proj.last_updated = datetime.now().strftime("%Y-%m-%d")
+
+        db.commit()
+        db.refresh(proj)
+
+        proj_dict = _project_to_dict(db, proj)
+        print("✏️ 과제 수정(DB):", proj_dict)
+        return {"message": "과제 수정 완료", "project": proj_dict}
     except HTTPException:
         raise
     except Exception as e:
         print("❌ /projects update_project error:", repr(e))
         raise HTTPException(status_code=400, detail=f"수정 실패: {str(e)}")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 @app.delete("/projects/{project_id}")
 def delete_project(project_id: int):
     """
-    과제 삭제 – PROJECTS 리스트에서 id가 project_id인 항목 제거.
+    과제 삭제 – projects/project_files 테이블에서 삭제.
+    (실제 파일(uploads/project_{id})는 일단 그대로 두고, 필요하면 나중에 정리)
     """
-    global PROJECTS
-    before = len(PROJECTS)
-    PROJECTS = [p for p in PROJECTS if p.get("id") != project_id]
-    if len(PROJECTS) < before:
-        print(f"🗑️ 과제 삭제: {project_id}")
+    db = SessionLocal()
+    try:
+        proj = db.query(Project).filter(Project.id == project_id).first()
+        if not proj:
+            raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+
+        db.query(ProjectFile).filter(ProjectFile.project_id == project_id).delete()
+        db.delete(proj)
+        db.commit()
+        print(f"🗑️ 과제 삭제(DB): {project_id}")
         return {"message": f"ID {project_id} 과제 삭제 완료"}
-    raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 @app.post("/projects/{project_id}/upload")
 async def upload_project_file(project_id: int, file: UploadFile = File(...)):
     """
-    각 과제별 파일 업로드 (임시, uploads/project_{id}/ 디렉터리에 저장)
+    각 과제별 파일 업로드 – DB(project_files) + uploads/project_{id}/
     """
-    project = next((p for p in PROJECTS if p.get("id") == project_id), None)
-    if not project:
-        raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+    db = SessionLocal()
+    try:
+        proj = db.query(Project).filter(Project.id == project_id).first()
+        if not proj:
+            raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
 
-    proj_dir = os.path.join(UPLOAD_DIR, f"project_{project_id}")
-    os.makedirs(proj_dir, exist_ok=True)
+        proj_dir = os.path.join(UPLOAD_DIR, f"project_{project_id}")
+        os.makedirs(proj_dir, exist_ok=True)
 
-    file_path = os.path.join(proj_dir, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        file_path = os.path.join(proj_dir, file.filename)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-    # files 필드에 파일명 추가
-    if "files" not in project or not isinstance(project["files"], list):
-        project["files"] = []
-    project["files"].append(file.filename)
-    project["last_updated"] = datetime.now().strftime("%Y-%m-%d")
+        upload_date = datetime.now().strftime("%Y-%m-%d")
+        pf = ProjectFile(
+            project_id=project_id,
+            filename=file.filename,
+            upload_date=upload_date,
+        )
+        db.add(pf)
+        db.commit()
 
-    return {"message": "파일 업로드 완료", "filename": file.filename}
+        proj.last_updated = upload_date
+        db.commit()
+
+        return {"message": "파일 업로드 완료", "filename": file.filename}
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 @app.get("/projects/{project_id}/files")
 def list_project_files(project_id: int):
-    project = next((p for p in PROJECTS if p.get("id") == project_id), None)
-    if not project:
-        raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
-    return project.get("files", [])
+    db = SessionLocal()
+    try:
+        proj = db.query(Project).filter(Project.id == project_id).first()
+        if not proj:
+            raise HTTPException(status_code=404, detail="해당 과제를 찾을 수 없습니다.")
+
+        files = (
+            db.query(ProjectFile)
+            .filter(ProjectFile.project_id == project_id)
+            .all()
+        )
+        return [f.filename for f in files]
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 # =========================
