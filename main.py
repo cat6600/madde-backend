@@ -11,7 +11,12 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from supabase import create_client
+
+# 🔹 Supabase는 나중에 쓸 예정이므로, 패키지가 없어도 서버가 죽지 않도록 방어
+try:
+  from supabase import create_client  # type: ignore
+except ImportError:
+  create_client = None  # 패키지 없으면 그냥 None으로 둠
 
 # =========================
 # 0. Supabase 클라이언트 초기화 (Step 5)
@@ -21,12 +26,15 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 supabase = None
-if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+if SUPABASE_URL and SUPABASE_SERVICE_KEY and create_client is not None:
     supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     print("✅ Supabase client initialized")
 else:
-    print("⚠️ Supabase env(SUPABASE_URL / SUPABASE_SERVICE_KEY)가 설정되지 않았습니다. "
-          "(현재는 파일을 로컬 /uploads에만 저장 중입니다.)")
+    print(
+        "⚠️ Supabase client 미사용 상태 "
+        "(env 미설정 또는 supabase 패키지 미설치 – 현재는 /uploads 로컬 저장만 사용 중)"
+    )
+
 
 app = FastAPI()
 
