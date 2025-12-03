@@ -4,4 +4,3 @@ sqlalchemy
 pydantic
 python-multipart
 psycopg2-binary
-supabase-py
