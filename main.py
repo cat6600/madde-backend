@@ -28,82 +28,83 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 supabase = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY and create_client is not None:
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    print("✅ Supabase client initialized")
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        print("✅ Supabase client initialized")
+    except Exception as e:
+        supabase = None
+        print("⚠️ Supabase client 초기화 실패:", repr(e))
 else:
     print(
         "⚠️ Supabase client 미사용 상태 "
-        "(env 미설정 또는 supabase 패키지 미설치 – 파일은 로컬 /uploads에 저장 중)"
+        "(env 미설정 또는 supabase 패키지 미설치 – 현재는 /uploads 로컬 저장만 사용 중)"
     )
 
 # =========================
-# Supabase Storage 헬퍼 함수
+# Supabase / 로컬 공용 설정 & 헬퍼
 # =========================
 
 SUPABASE_BUCKET_NAME = "madde-files"  # Supabase Storage 버킷 이름
 
 
-def ensure_supabase():
+def is_supabase_enabled() -> bool:
+    """Supabase를 쓸 수 있는지 여부만 판단."""
+    return supabase is not None
+
+
+def _save_ir_file(
+    f: UploadFile,
+    folder: Optional[str],
+) -> str:
     """
-    Supabase가 설정되지 않은 경우 500 에러를 발생시켜서
-    잘못된 설정을 바로 알 수 있게 함.
+    IR 파일 1개 저장하고, DB에 넣을 stored_name 값을 리턴.
+    - Supabase 가능하면: 버킷 내부 경로 (예: 'ir/Folder/2025/12/uuid_파일명')
+    - Supabase 불가하면: 로컬 상대 경로 (예: 'ir/Folder/파일명')
     """
-    if supabase is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Supabase가 설정되지 않았습니다. SUPABASE_URL / SUPABASE_SERVICE_KEY / 버킷 설정을 확인하세요.",
-        )
+    original_name = f.filename
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", original_name or "")
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique = uuid.uuid4().hex
+    stored_filename = f"{timestamp}_{unique}_{safe}"
 
-def upload_to_supabase(path_in_bucket: str, file_obj: UploadFile) -> str:
-    """
-    Supabase Storage에 파일 업로드.
-    - path_in_bucket: 버킷 내부 경로 (예: 'ir/Formnext2025/2025/12/uuid_파일명.pdf')
-    - file_obj: FastAPI UploadFile 객체
-    리턴값: path_in_bucket (DB에는 이 값을 저장)
-    """
-    ensure_supabase()
+    folder_name = folder if folder else "default"
 
-    # 파일 내용을 메모리로 읽기
-    file_bytes = file_obj.file.read()
+    # 1) Supabase 사용 가능하면 Supabase에 먼저 시도
+    if is_supabase_enabled():
+        today_path = datetime.now().strftime("%Y/%m")
+        path_in_bucket = f"ir/{folder_name}/{today_path}/{stored_filename}"
 
-    # 업로드
-    res = supabase.storage.from_(SUPABASE_BUCKET_NAME).upload(
-        path_in_bucket,
-        file_bytes,
-    )
+        try:
+            file_bytes = f.file.read()
+            res = supabase.storage.from_(SUPABASE_BUCKET_NAME).upload(
+                path_in_bucket,
+                file_bytes,
+            )
+            if hasattr(res, "error") and res.error:
+                print("⚠️ Supabase 업로드 실패, 로컬로 fallback:", repr(res.error))
+            else:
+                # Supabase 성공
+                return path_in_bucket
+        except Exception as e:
+            print("⚠️ Supabase 업로드 중 예외, 로컬로 fallback:", repr(e))
+        finally:
+            # 실패했으면 파일 포인터 되돌려서 로컬 저장에 사용
+            f.file.seek(0)
 
-    # supabase-py 버전에 따라 응답 객체에 error 속성이 있을 수 있음
-    if hasattr(res, "error") and res.error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Supabase 업로드 실패: {res.error.message}",
-        )
+    # 2) 여기부터는 로컬 fallback (/uploads/ir ...)
+    base_dir = IR_UPLOAD_DIR
+    if folder:
+        base_dir = os.path.join(IR_UPLOAD_DIR, folder_name)
+    os.makedirs(base_dir, exist_ok=True)
 
-    return path_in_bucket
+    file_path = os.path.join(base_dir, stored_filename)
+    with open(file_path, "wb") as b:
+        shutil.copyfileobj(f.file, b)
 
-
-def get_public_url(path_in_bucket: str) -> str:
-    """
-    Supabase Storage에 저장된 파일의 public URL 생성
-    (버킷이 public일 때 사용)
-    """
-    ensure_supabase()
-    return supabase.storage.from_(SUPABASE_BUCKET_NAME).get_public_url(path_in_bucket)
-
-
-def delete_from_supabase(path_in_bucket: str) -> None:
-    """
-    Supabase Storage에서 파일 삭제.
-    실패해도 서비스 전체가 죽지 않도록 예외는 잡아서 무시.
-    """
-    if supabase is None:
-        return
-
-    try:
-        supabase.storage.from_(SUPABASE_BUCKET_NAME).remove([path_in_bucket])
-    except Exception as e:
-        print("⚠️ Supabase 삭제 중 오류:", repr(e))
+    # DB에는 uploads 기준 상대 경로로 저장 (예: 'ir/default/파일명')
+    rel_path = os.path.relpath(file_path, UPLOAD_DIR)
+    return rel_path.replace("\\", "/")
 
 
 app = FastAPI()
@@ -600,14 +601,69 @@ def delete_ip_file(file_id: int):
         db.close()
 
 # =========================
-# 5. IR/마케팅 자료 관리 (Supabase Storage 사용)
+# 5. IR/마케팅 자료 관리 (Supabase + 로컬 fallback)
 # =========================
+
+def _save_ir_file(
+    f: UploadFile,
+    folder: Optional[str],
+) -> str:
+    """
+    IR 파일 1개 저장하고, DB에 넣을 stored_name 값을 리턴.
+    - Supabase 가능하면: 버킷 내부 경로 (예: 'ir/Folder/2025/12/uuid_파일명')
+    - Supabase 불가하면: 로컬 상대 경로 (예: 'ir/Folder/파일명')
+    """
+    original_name = f.filename
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", original_name or "")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique = uuid.uuid4().hex
+    stored_filename = f"{timestamp}_{unique}_{safe}"
+
+    folder_name = folder if folder else "default"
+
+    # Supabase 사용 가능이면 Supabase에 저장
+    if is_supabase_enabled():
+        today_path = datetime.now().strftime("%Y/%m")
+        path_in_bucket = f"ir/{folder_name}/{today_path}/{stored_filename}"
+
+        # 파일 내용을 메모리로 읽은 뒤 Supabase 업로드
+        file_bytes = f.file.read()
+        res = supabase.storage.from_(SUPABASE_BUCKET_NAME).upload(
+            path_in_bucket,
+            file_bytes,
+        )
+        if hasattr(res, "error") and res.error:
+            # Supabase 오류 시에도 로컬 fallback
+            print("⚠️ Supabase 업로드 실패, 로컬로 fallback:", repr(res.error))
+        else:
+            # Supabase에 성공적으로 올라갔으면 이 경로를 반환
+            return path_in_bucket
+
+        # 여기까지 왔으면 Supabase 업로드 실패 → f.file 포인터를 다시 처음으로
+        f.file.seek(0)
+
+    # 🔹 여기부터는 로컬 fallback (/uploads/ir ...)
+
+    base_dir = IR_UPLOAD_DIR
+    if folder:
+        base_dir = os.path.join(IR_UPLOAD_DIR, folder_name)
+    os.makedirs(base_dir, exist_ok=True)
+
+    file_path = os.path.join(base_dir, stored_filename)
+    with open(file_path, "wb") as b:
+        shutil.copyfileobj(f.file, b)
+
+    # DB에는 uploads 기준 상대 경로로 저장: ir/폴더/파일명
+    rel_path = os.path.relpath(file_path, UPLOAD_DIR)  # 예: 'ir/default/2025..._파일명'
+    return rel_path.replace("\\", "/")  # 윈도우 대비 슬래시 통일
+
 
 @app.get("/ir")
 def get_ir(category: Optional[str] = None):
     """
     IR/마케팅 자료 목록 조회
-    - DB에는 stored_name에 Supabase 버킷 내부 경로(path_in_bucket)를 저장
+    - DB에는 stored_name에 Supabase path 또는 로컬 상대 경로를 저장
     - 응답에서는 file_url을 만들어서 프론트에서 바로 쓸 수 있게 내려줌
     """
     db = SessionLocal()
@@ -619,20 +675,37 @@ def get_ir(category: Optional[str] = None):
 
         result = []
         for r in records:
-            path_in_bucket = r.stored_name
+            stored = r.stored_name or ""
             file_url = None
-            if path_in_bucket:
-                try:
-                    file_url = get_public_url(path_in_bucket)
-                except Exception as e:
-                    print("⚠️ IR get_public_url 오류:", repr(e))
+
+            if stored:
+                if is_supabase_enabled() and not stored.startswith("ir/"):  # 혹시 예전 데이터
+                    # 예전 구조에서는 stored_name이 파일명만이고 folder 컬럼을 같이 씀
+                    if r.folder:
+                        path_in_bucket = f"ir/{r.folder}/{stored}"
+                    else:
+                        path_in_bucket = f"ir/default/{stored}"
+                    try:
+                        file_url = supabase.storage.from_(SUPABASE_BUCKET_NAME).get_public_url(path_in_bucket)
+                    except Exception as e:
+                        print("⚠️ IR get_public_url(legacy) 오류:", repr(e))
+                elif is_supabase_enabled() and stored.startswith("ir/"):
+                    # Supabase path 그대로 public URL 생성
+                    try:
+                        file_url = supabase.storage.from_(SUPABASE_BUCKET_NAME).get_public_url(stored)
+                    except Exception as e:
+                        print("⚠️ IR get_public_url 오류:", repr(e))
+                else:
+                    # Supabase 미사용 → 로컬 static 경로로 접근
+                    # stored는 uploads 기준 상대 경로 (예: 'ir/폴더/파일')
+                    file_url = f"/uploads/{stored.lstrip('/')}"
 
             result.append(
                 {
                     "id": r.id,
                     "original_name": r.original_name,
-                    "stored_name": r.stored_name,  # Supabase path
-                    "file_url": file_url,          # 실제 접근용 URL
+                    "stored_name": r.stored_name,
+                    "file_url": file_url,
                     "category": r.category,
                     "folder": r.folder,
                     "upload_date": r.upload_date,
@@ -653,38 +726,25 @@ async def upload_ir(
     folder: Optional[str] = Form(None),
 ):
     """
-    IR/마케팅 자료 다중 파일 업로드 – Supabase Storage 사용
-    - Supabase 버킷: madde-files
-    - 경로 예: ir/<folder_name>/YYYY/MM/타임스탬프_uuid_파일명.pdf
+    IR/마케팅 자료 다중 파일 업로드
+    - Supabase가 켜져 있으면 Supabase에 저장
+    - Supabase가 꺼져 있으면 로컬 /uploads/ir/... 에 저장
     """
     saved_ids = []
     db = SessionLocal()
 
     try:
         for f in file:
-            original_name = f.filename
-            safe = re.sub(r"[^A-Za-z0-9_.-]", "_", original_name or "")
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            unique = uuid.uuid4().hex
-            stored_filename = f"{timestamp}_{unique}_{safe}"
-
-            folder_name = folder if folder else "default"
-            today_path = datetime.now().strftime("%Y/%m")
-
-            path_in_bucket = f"ir/{folder_name}/{today_path}/{stored_filename}"
-
-            upload_to_supabase(path_in_bucket, f)
-
+            stored_name = _save_ir_file(f, folder)
             upload_date = datetime.now().strftime("%Y-%m-%d")
 
             ir = IRFile(
-                original_name=original_name,
-                stored_name=path_in_bucket,
+                original_name=f.filename,
+                stored_name=stored_name,
                 category=category,
                 folder=folder,
                 upload_date=upload_date,
-                size=0,  # 필요시 추후 업데이트
+                size=0,
             )
             db.add(ir)
             db.commit()
@@ -705,7 +765,7 @@ def delete_ir(ir_id: int):
     """
     IR 자료 삭제
     - DB에서 row 삭제
-    - Supabase Storage에서도 해당 파일 삭제 시도
+    - Supabase 또는 로컬 파일도 같이 삭제 (가능한 경우)
     """
     db = SessionLocal()
     try:
@@ -713,14 +773,31 @@ def delete_ir(ir_id: int):
         if not ir:
             raise HTTPException(status_code=404, detail="해당 IR 자료를 찾을 수 없습니다.")
 
-        if ir.stored_name:
-            delete_from_supabase(ir.stored_name)
+        stored = ir.stored_name or ""
+
+        # Supabase 사용 중 & Supabase path인 경우
+        if is_supabase_enabled() and stored.startswith("ir/"):
+            try:
+                supabase.storage.from_(SUPABASE_BUCKET_NAME).remove([stored])
+            except Exception as e:
+                print("⚠️ Supabase 삭제 중 오류:", repr(e))
+        else:
+            # 로컬 파일 삭제 시도
+            if stored:
+                # stored가 'ir/폴더/파일' 형식이면 uploads 기준으로 맞춰줌
+                local_path = os.path.join(UPLOAD_DIR, stored)
+                try:
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                except Exception as e:
+                    print("⚠️ 로컬 IR 파일 삭제 중 오류:", repr(e))
 
         db.delete(ir)
         db.commit()
         return {"message": "IR 자료 삭제 완료 ✅"}
     finally:
         db.close()
+
 
 # =========================
 # 6. 인건비 / 현물 현황
